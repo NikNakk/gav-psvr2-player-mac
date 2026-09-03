@@ -46,7 +46,7 @@ if [[ $# -gt 0 && ( "$1" == http://* || "$1" == https://* ) ]]; then
 		--format 'bv*[ext=mp4][vcodec^=av01]+ba[ext=m4a]/bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]' \
 		--merge-output-format mp4 \
 		--write-info-json \
-		--output "$CACHE_DIR/%(title).180B [%(id)s].%(ext)s" \
+		--output "$CACHE_DIR/%(title)s [%(id)s].%(ext)s" \
 		--print after_move:filepath \
 		"$MEDIA_URL") || exit 1
 
