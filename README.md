@@ -103,6 +103,28 @@ To open a specific file right away, pass it as an argument:
 player/play "video_180_SBS.mp4"
 ```
 
+### Experimental YouTube playback
+
+The `youtube-vr-support` branch can also accept a YouTube URL. Install
+`yt-dlp` first:
+
+```sh
+brew install yt-dlp
+player/play "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+For this initial implementation the launcher downloads/merges the best
+compatible MP4 into `~/Library/Caches/GAVPSVR2/YouTube/` and then hands the
+local file to the existing AVFoundation player. It prefers AV1 video with
+M4A audio and falls back to H.264 MP4. The accompanying `yt-dlp` info JSON
+is retained in the cache for future automatic detection of YouTube VR180 /
+360 projection and stereo metadata.
+
+This is deliberately a first step rather than true progressive streaming:
+playback begins after the download/merge completes. Projection and stereo
+can still be selected manually from GAV's existing Format panel if filename
+auto-detection is not sufficient.
+
 `play` keeps the log in your terminal; when launched from Finder/Dock the
 log goes to `~/Library/Logs/PSVR2Player.log` (watch with `tail -f` or
 Console.app).
