@@ -14,6 +14,45 @@ if [[ ! -x "$BIN" ]]; then
 	exit 1
 fi
 
+# Experimental YouTube support. Resolve a YouTube/watch URL to a cached local
+# MP4 before handing it to the existing AVFoundation playback path. Keeping
+# this in the launcher makes the first implementation deliberately isolated
+# from the renderer and file-picker code.
+if [[ $# -gt 0 && ( "$1" == http://* || "$1" == https://* ) ]]; then
+	MEDIA_URL="$1"
+	shift
+
+	if ! command -v yt-dlp >/dev/null 2>&1; then
+		echo "YouTube playback requires yt-dlp. Install it with: brew install yt-dlp" >&2
+		exit 1
+	fi
+
+	CACHE_DIR="$HOME/Library/Caches/GAVPSVR2/YouTube"
+	mkdir -p "$CACHE_DIR" || exit 1
+
+	echo "Resolving YouTube video…"
+	# Prefer AV1 in MP4: modern Apple Silicon can hardware-decode it and YouTube
+	# offers its highest VR resolutions in AV1. Fall back to H.264 MP4. The
+	# info JSON is retained beside the video for future automatic VR180/360
+	# projection/stereo detection.
+	LOCAL_FILE=$(yt-dlp \
+		--no-playlist \
+		--no-warnings \
+		--format 'bv*[ext=mp4][vcodec^=av01]+ba[ext=m4a]/bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]' \
+		--merge-output-format mp4 \
+		--write-info-json \
+		--output "$CACHE_DIR/%(id)s.%(ext)s" \
+		--print after_move:filepath \
+		"$MEDIA_URL") || exit 1
+
+	if [[ -z "$LOCAL_FILE" || ! -f "$LOCAL_FILE" ]]; then
+		echo "yt-dlp did not produce a playable local file." >&2
+		exit 1
+	fi
+
+	set -- "$LOCAL_FILE" "$@"
+fi
+
 : > "$LOG"
 open -a "$APP" --stdout "$LOG" --stderr "$LOG" --args "$@" || exit 1
 
