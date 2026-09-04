@@ -48,31 +48,31 @@ static float2 project_eac(float3 w) {
     int rotation = 0; // 0, 1=90, 3=270
 
     if (ax >= ay && ax >= az) {
-        if (p.x >= 0.0) { // RIGHT -> top right
+        if (p.x >= 0.0) {
             uf = -p.z / p.x;
             vf =  p.y / p.x;
             col = 2; row = 0;
-        } else {          // LEFT -> top left
+        } else {
             uf = -p.z / p.x;
             vf = -p.y / p.x;
             col = 0; row = 0;
         }
     } else if (ay >= ax && ay >= az) {
-        if (p.y >= 0.0) { // DOWN -> bottom left, rotate 270
+        if (p.y >= 0.0) {
             uf =  p.x / p.y;
             vf = -p.z / p.y;
             col = 0; row = 1; rotation = 3;
-        } else {          // UP -> bottom right, rotate 270
+        } else {
             uf = -p.x / p.y;
             vf = -p.z / p.y;
             col = 2; row = 1; rotation = 3;
         }
     } else {
-        if (p.z >= 0.0) { // FRONT -> top middle
+        if (p.z >= 0.0) {
             uf = p.x / p.z;
             vf = p.y / p.z;
             col = 1; row = 0;
-        } else {          // BACK -> bottom middle, rotate 90
+        } else {
             uf = p.x / p.z;
             vf = -p.y / p.z;
             col = 1; row = 1; rotation = 1;
@@ -85,8 +85,6 @@ static float2 project_eac(float3 w) {
         float t = -uf; uf = vf; vf = t;
     }
 
-    // EAC differs from a normal cubemap by applying atan independently to
-    // each face coordinate before packing it into the 3x2 texture.
     uf = (2.0 / PI) * atan(uf) + 0.5;
     vf = (2.0 / PI) * atan(vf) + 0.5;
     return float2((uf + float(col)) / 3.0,
@@ -148,10 +146,10 @@ let detectStart = #"""
             cfg.projection = .fisheye
 """#
 let detectStartEAC = #"""
-        // YouTube downloads produced by player/play include the selected frame
-        // dimensions as [WIDTHxHEIGHT]. Conventional equirectangular 360 is
-        // ~2:1, while YouTube EAC is ~3:2. Only use the aspect-ratio heuristic
-        // when the filename also identifies the video as 360 content.
+        // YouTube downloads produced by player/play include [YT] and the
+        // selected frame dimensions as [WIDTHxHEIGHT]. Use a ~3:2 aspect ratio
+        // only for these tagged files as the EAC signal; arbitrary local 3:2
+        // videos remain untouched.
         var cachedAspect: Float? = nil
         if let r = n.range(of: #"\[(\d{3,5})X(\d{3,5})\]"#, options: .regularExpression) {
             let dims = String(n[r]).dropFirst().dropLast().split(separator: "X")
@@ -159,7 +157,7 @@ let detectStartEAC = #"""
                 cachedAspect = w / h
             }
         }
-        let looksLikeEAC = n.contains("360") && cachedAspect.map { $0 > 1.40 && $0 < 1.65 } == true
+        let looksLikeEAC = n.contains("[YT]") && cachedAspect.map { $0 > 1.40 && $0 < 1.65 } == true
 
         if n.contains("EAC360") || n.contains("_EAC") || looksLikeEAC {
             cfg.projection = .eac360
