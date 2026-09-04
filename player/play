@@ -34,10 +34,6 @@ if [[ $# -gt 0 && ( "$1" == http://* || "$1" == https://* ) ]]; then
 	# Prefer AV1 in MP4: modern Apple Silicon can hardware-decode it and YouTube
 	# offers its highest VR resolutions in AV1. Fall back to H.264 MP4. The
 	# info JSON is retained beside the video for future metadata work.
-	#
-	# Keep title and selected frame dimensions in the cached filename, and tag
-	# the file as [YT]. GAV uses [YT] + a ~3:2 aspect ratio as a safe signal for
-	# YouTube EAC, while arbitrary local 3:2 videos remain unaffected.
 	LOCAL_FILE=$(yt-dlp \
 		--no-playlist \
 		--no-warnings \
@@ -51,6 +47,20 @@ if [[ $# -gt 0 && ( "$1" == http://* || "$1" == https://* ) ]]; then
 	if [[ -z "$LOCAL_FILE" || ! -f "$LOCAL_FILE" ]]; then
 		echo "yt-dlp did not produce a playable local file." >&2
 		exit 1
+	fi
+
+	# The DASH representations selected above use YouTube EAC for the 360°
+	# videos we need to support. Frame dimensions are not a reliable signal --
+	# EAC may still be delivered in a 2:1 frame (for example 3840x1920).
+	# Add an explicit filename hint when the YouTube title identifies the video
+	# as 360 content; PlaybackConfig.detect() already recognises EAC360.
+	BASENAME="${LOCAL_FILE:t}"
+	if [[ "${BASENAME:u}" == *360* && "${BASENAME:u}" != *180* && "${BASENAME:u}" != EAC360* ]]; then
+		EAC_FILE="${LOCAL_FILE:h}/EAC360 ${BASENAME}"
+		if [[ "$EAC_FILE" != "$LOCAL_FILE" ]]; then
+			mv -f -- "$LOCAL_FILE" "$EAC_FILE" || exit 1
+			LOCAL_FILE="$EAC_FILE"
+		fi
 	fi
 
 	set -- "$LOCAL_FILE" "$@"
