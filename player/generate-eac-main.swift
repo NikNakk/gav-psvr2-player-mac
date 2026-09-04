@@ -100,8 +100,48 @@ replaceOnce("    if (mode == 2) {\n        // equidistant fisheye, forward axis 
             with: "    if (mode == 3) {\n        float2 eac = project_eac(w);\n        u = eac.x;\n        v = eac.y;\n    } else if (mode == 2) {\n        // equidistant fisheye, forward axis -Z")
 
 replaceOnce("    case fisheye = 2\n", with: "    case fisheye = 2\n    case eac360 = 3\n")
-replaceOnce("        case .fisheye: return \"fisheye\"\n", with: "        case .fisheye: return \"fisheye\"\n        case .eac360: return \"YouTube EAC 360°\"\n")
-replaceOnce("        case .fisheye: return \"fisheye\"\n", with: "        case .fisheye: return \"fisheye\"\n        case .eac360: return \"EAC 360°\"\n")
+
+let labelBlock = #"""
+    var label: String {
+        switch self {
+        case .equirect360: return "equirect 360°"
+        case .equirect180: return "half-equirect 180°"
+        case .fisheye: return "fisheye"
+        }
+    }
+"""#
+let labelBlockEAC = #"""
+    var label: String {
+        switch self {
+        case .equirect360: return "equirect 360°"
+        case .equirect180: return "half-equirect 180°"
+        case .fisheye: return "fisheye"
+        case .eac360: return "YouTube EAC 360°"
+        }
+    }
+"""#
+replaceOnce(labelBlock, with: labelBlockEAC)
+
+let shortLabelBlock = #"""
+    var shortLabel: String {
+        switch self {
+        case .equirect360: return "360°"
+        case .equirect180: return "180°"
+        case .fisheye: return "fisheye"
+        }
+    }
+"""#
+let shortLabelBlockEAC = #"""
+    var shortLabel: String {
+        switch self {
+        case .equirect360: return "360°"
+        case .equirect180: return "180°"
+        case .fisheye: return "fisheye"
+        case .eac360: return "EAC 360°"
+        }
+    }
+"""#
+replaceOnce(shortLabelBlock, with: shortLabelBlockEAC)
 
 // Explicit EAC filename hints are useful for downloaded test files. Ordinary
 // files containing only "360" continue to use the existing equirectangular
