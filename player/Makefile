@@ -3,7 +3,8 @@ LIBUSB_CFLAGS = -I$(BREW_PREFIX)/include/libusb-1.0
 LIBUSB_LDFLAGS = -L$(BREW_PREFIX)/lib -lusb-1.0
 
 APP = PSVR2Player.app
-GENERATED_MAIN = .main-eac.swift
+GENERATED_DIR = .generated-eac
+GENERATED_MAIN = $(GENERATED_DIR)/main.swift
 
 all: $(APP)
 
@@ -14,6 +15,7 @@ lut.o: lut.c
 	clang -O2 -c lut.c -o lut.o
 
 $(GENERATED_MAIN): main.swift generate-eac-main.swift
+	mkdir -p $(GENERATED_DIR)
 	swift generate-eac-main.swift main.swift $(GENERATED_MAIN)
 
 psvr2player: $(GENERATED_MAIN) overlay.swift sweeper.swift meta.swift passthrough.swift cpsvr2.o lut.o cpsvr2.h
@@ -34,6 +36,6 @@ $(APP): psvr2player Info.plist environment.jpg
 	@echo "Done: $(APP) — run ./play [file]"
 
 clean:
-	rm -rf psvr2player cpsvr2.o lut.o $(GENERATED_MAIN) $(APP)
+	rm -rf psvr2player cpsvr2.o lut.o $(GENERATED_DIR) $(APP)
 
 .PHONY: all clean
