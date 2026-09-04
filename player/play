@@ -33,20 +33,19 @@ if [[ $# -gt 0 && ( "$1" == http://* || "$1" == https://* ) ]]; then
 	echo "Resolving YouTube video…"
 	# Prefer AV1 in MP4: modern Apple Silicon can hardware-decode it and YouTube
 	# offers its highest VR resolutions in AV1. Fall back to H.264 MP4. The
-	# info JSON is retained beside the video for future automatic VR180/360
-	# projection/stereo detection.
+	# info JSON is retained beside the video for future metadata work.
 	#
-	# Keep the title in the cached filename because GAV's existing format
-	# detection intentionally uses filename hints such as "180" and "360".
-	# The YouTube ID remains in brackets so different videos with the same title
-	# do not collide.
+	# Keep title and selected frame dimensions in the cached filename. GAV uses
+	# the title for its existing 180/360 hints, and dimensions let it distinguish
+	# a conventional ~2:1 equirectangular 360 frame from YouTube's ~3:2 EAC
+	# packing without treating every YouTube 360 upload as EAC.
 	LOCAL_FILE=$(yt-dlp \
 		--no-playlist \
 		--no-warnings \
 		--format 'bv*[ext=mp4][vcodec^=av01]+ba[ext=m4a]/bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]' \
 		--merge-output-format mp4 \
 		--write-info-json \
-		--output "$CACHE_DIR/%(title)s [%(id)s].%(ext)s" \
+		--output "$CACHE_DIR/%(title)s [%(id)s] [%(width)sx%(height)s].%(ext)s" \
 		--print after_move:filepath \
 		"$MEDIA_URL") || exit 1
 
