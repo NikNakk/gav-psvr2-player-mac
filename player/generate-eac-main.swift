@@ -143,11 +143,30 @@ let shortLabelBlockEAC = #"""
 """#
 replaceOnce(shortLabelBlock, with: shortLabelBlockEAC)
 
-// Explicit EAC filename hints are useful for downloaded test files. Ordinary
-// files containing only "360" continue to use the existing equirectangular
-// behaviour until YouTube metadata-based auto-detection is added.
-replaceOnce("        if n.contains(\"FISHEYE\") || n.contains(\"VR180FISH\") {",
-            with: "        if n.contains(\"EAC360\") || n.contains(\"_EAC\") {\n            cfg.projection = .eac360\n        } else if n.contains(\"FISHEYE\") || n.contains(\"VR180FISH\") {")
+let detectStart = #"""
+        if n.contains("FISHEYE") || n.contains("VR180FISH") {
+            cfg.projection = .fisheye
+"""#
+let detectStartEAC = #"""
+        // YouTube downloads produced by player/play include the selected frame
+        // dimensions as [WIDTHxHEIGHT]. Conventional equirectangular 360 is
+        // ~2:1, while YouTube EAC is ~3:2. Only use the aspect-ratio heuristic
+        // when the filename also identifies the video as 360 content.
+        var cachedAspect: Float? = nil
+        if let r = n.range(of: #"\[(\d{3,5})X(\d{3,5})\]"#, options: .regularExpression) {
+            let dims = String(n[r]).dropFirst().dropLast().split(separator: "X")
+            if dims.count == 2, let w = Float(dims[0]), let h = Float(dims[1]), h > 0 {
+                cachedAspect = w / h
+            }
+        }
+        let looksLikeEAC = n.contains("360") && cachedAspect.map { $0 > 1.40 && $0 < 1.65 } == true
+
+        if n.contains("EAC360") || n.contains("_EAC") || looksLikeEAC {
+            cfg.projection = .eac360
+        } else if n.contains("FISHEYE") || n.contains("VR180FISH") {
+            cfg.projection = .fisheye
+"""#
+replaceOnce(detectStart, with: detectStartEAC)
 replaceOnce("        } else if cfg.projection == .equirect360 {\n            cfg.stereo = .mono\n",
             with: "        } else if cfg.projection == .equirect360 || cfg.projection == .eac360 {\n            cfg.stereo = .mono\n")
 
