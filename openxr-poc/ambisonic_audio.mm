@@ -9,16 +9,17 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
 @interface GAVAmbisonicState : NSObject
 @property(nonatomic, strong) AVAudioEngine *engine;
 @property(nonatomic, strong) AVAudioEnvironmentNode *environment;
-@property(nonatomic, strong) NSArray<AVAudioPlayerNode *> *players;
-@property(nonatomic, strong) NSArray<AVAudioFile *> *files;
+@property(nonatomic, strong) AVAudioPlayerNode *player;
+@property(nonatomic, strong) AVAudioFile *file;
+@property(nonatomic, strong) AVAudioFormat *ambisonicFormat;
 @property(nonatomic, copy) NSString *sourcePath;
+@property(nonatomic, copy) NSString *pcmPath;
 @end
 
 @implementation GAVAmbisonicState
@@ -26,20 +27,13 @@
 
 struct GAVAmbisonicAudio {
     void *retainedState{nullptr};
+    float sceneRight[3]{1.0f, 0.0f, 0.0f};
+    float sceneUp[3]{0.0f, 1.0f, 0.0f};
+    float sceneForward[3]{0.0f, 0.0f, -1.0f};
+    bool sceneBasisValid{false};
 };
 
 namespace {
-
-static constexpr NSUInteger kSpeakerCount = 6;
-
-enum SpeakerIndex : NSUInteger {
-    SpeakerFront = 0,
-    SpeakerBack = 1,
-    SpeakerLeft = 2,
-    SpeakerRight = 3,
-    SpeakerUp = 4,
-    SpeakerDown = 5,
-};
 
 GAVAmbisonicState *stateFor(GAVAmbisonicAudio *audio)
 {
@@ -134,96 +128,80 @@ bool routeEngineToPSVR2(AVAudioEngine *engine)
     return true;
 }
 
-NSArray<NSString *> *speakerCachePaths(NSString *sidecarPath)
+NSString *nativeCachePath(NSString *sidecarPath)
+{
+    return [[sidecarPath stringByDeletingPathExtension] stringByAppendingString:@".gav-foa-acn-sn3d.caf"];
+}
+
+void removeOldSpeakerCache(NSString *sidecarPath)
 {
     NSString *base = [sidecarPath stringByDeletingPathExtension];
-    return @[
-        [base stringByAppendingString:@".gav-foa-front.wav"],
-        [base stringByAppendingString:@".gav-foa-back.wav"],
-        [base stringByAppendingString:@".gav-foa-left.wav"],
-        [base stringByAppendingString:@".gav-foa-right.wav"],
-        [base stringByAppendingString:@".gav-foa-up.wav"],
-        [base stringByAppendingString:@".gav-foa-down.wav"],
+    NSArray<NSString *> *suffixes = @[
+        @".gav-foa-front.wav",
+        @".gav-foa-back.wav",
+        @".gav-foa-left.wav",
+        @".gav-foa-right.wav",
+        @".gav-foa-up.wav",
+        @".gav-foa-down.wav",
     ];
-}
-
-bool haveSpeakerCache(NSArray<NSString *> *paths)
-{
     NSFileManager *fm = NSFileManager.defaultManager;
-    for (NSString *path in paths) {
-        if (![fm fileExistsAtPath:path]) {
-            return false;
+    for (NSString *suffix in suffixes) {
+        NSString *path = [base stringByAppendingString:suffix];
+        if ([fm fileExistsAtPath:path]) {
+            [fm removeItemAtPath:path error:nil];
         }
     }
-    return true;
 }
 
-bool buildSpeakerCache(NSString *sidecarPath, NSArray<NSString *> *paths)
+bool buildNativeCache(NSString *sidecarPath, NSString *pcmPath)
 {
-    if (haveSpeakerCache(paths)) {
-        std::printf("[audio] ambisonic decode cache hit\n");
+    if ([[NSFileManager defaultManager] fileExistsAtPath:pcmPath]) {
+        std::printf("[audio] native AmbiX decode cache hit\n");
+        removeOldSpeakerCache(sidecarPath);
         return true;
     }
 
-    // YouTube's ambisonics_quad is first-order AmbiX: ACN channel order
-    // W, Y, Z, X with SN3D normalization. Decode it to six cardinal virtual
-    // speakers. AVAudioEnvironmentNode then HRTF-renders those mono feeds.
-    // The 0.408/0.707 coefficients form a simple energy-balanced first-order
-    // decoder suitable for this proof-of-concept.
-    NSString *filter = @"[0:a:0]asplit=6[a0][a1][a2][a3][a4][a5];[a0]pan=mono|c0=0.4082482905*c0+0.7071067812*c3[front];[a1]pan=mono|c0=0.4082482905*c0-0.7071067812*c3[back];[a2]pan=mono|c0=0.4082482905*c0+0.7071067812*c1[left];[a3]pan=mono|c0=0.4082482905*c0-0.7071067812*c1[right];[a4]pan=mono|c0=0.4082482905*c0+0.7071067812*c2[up];[a5]pan=mono|c0=0.4082482905*c0-0.7071067812*c2[down]";
-
-    NSArray<NSString *> *labels = @[@"[front]", @"[back]", @"[left]", @"[right]", @"[up]", @"[down]"];
-    NSMutableArray<NSString *> *arguments = [NSMutableArray arrayWithArray:@[
+    // Preserve the four AmbiX channels exactly as decoded by ffmpeg. YouTube's
+    // ambisonics_quad is ACN/SN3D: W, Y, Z, X. The explicit HOA layout is
+    // supplied to AVAudioEngine below, so the cache only needs to preserve
+    // channel order and sample values.
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
+    task.arguments = @[
         @"ffmpeg",
         @"-hide_banner",
         @"-loglevel", @"error",
         @"-nostdin",
         @"-y",
         @"-i", sidecarPath,
-        @"-filter_complex", filter,
-    ]];
-    for (NSUInteger i = 0; i < kSpeakerCount; ++i) {
-        [arguments addObjectsFromArray:@[
-            @"-map", labels[i],
-            @"-c:a", @"pcm_s16le",
-            @"-ar", @"48000",
-            paths[i],
-        ]];
-    }
-
-    std::printf("[audio] decoding AmbiX sidecar to six-speaker HRTF cache...\n");
-    NSTask *task = [[NSTask alloc] init];
-    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
-    task.arguments = arguments;
+        @"-map", @"0:a:0",
+        @"-c:a", @"pcm_f32le",
+        @"-ar", @"48000",
+        @"-f", @"caf",
+        pcmPath,
+    ];
     task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
     task.standardError = [NSFileHandle fileHandleWithStandardError];
 
+    std::printf("[audio] decoding AmbiX sidecar to native 4-channel ACN/SN3D cache...\n");
     NSError *launchError = nil;
     if (![task launchAndReturnError:&launchError]) {
         std::fprintf(stderr,
-                     "[audio] could not launch ffmpeg for ambisonic decode: %s\n",
+                     "[audio] could not launch ffmpeg for AmbiX decode: %s\n",
                      launchError.localizedDescription.UTF8String ?: "unknown error");
         return false;
     }
     [task waitUntilExit];
-    if (task.terminationStatus != 0 || !haveSpeakerCache(paths)) {
+    if (task.terminationStatus != 0 ||
+        ![[NSFileManager defaultManager] fileExistsAtPath:pcmPath]) {
         std::fprintf(stderr,
-                     "[audio] ffmpeg ambisonic decode failed (status %d); using stereo fallback\n",
+                     "[audio] ffmpeg AmbiX decode failed (status %d); using stereo fallback\n",
                      task.terminationStatus);
         return false;
     }
-    return true;
-}
 
-void setDefaultSpeakerPositions(GAVAmbisonicState *state)
-{
-    NSArray<AVAudioPlayerNode *> *players = state.players;
-    players[SpeakerFront].position = AVAudioMake3DPoint(0.0f, 0.0f, -1.0f);
-    players[SpeakerBack].position = AVAudioMake3DPoint(0.0f, 0.0f, 1.0f);
-    players[SpeakerLeft].position = AVAudioMake3DPoint(-1.0f, 0.0f, 0.0f);
-    players[SpeakerRight].position = AVAudioMake3DPoint(1.0f, 0.0f, 0.0f);
-    players[SpeakerUp].position = AVAudioMake3DPoint(0.0f, 1.0f, 0.0f);
-    players[SpeakerDown].position = AVAudioMake3DPoint(0.0f, -1.0f, 0.0f);
+    removeOldSpeakerCache(sidecarPath);
+    return true;
 }
 
 void rotateVector(const XrQuaternionf &q,
@@ -244,6 +222,21 @@ void rotateVector(const XrQuaternionf &q,
     outZ = z + 2.0f * cz2;
 }
 
+float dot3(float ax, float ay, float az, const float b[3])
+{
+    return ax * b[0] + ay * b[1] + az * b[2];
+}
+
+void normalize3(float v[3])
+{
+    const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (length > 1e-6f) {
+        v[0] /= length;
+        v[1] /= length;
+        v[2] /= length;
+    }
+}
+
 } // namespace
 
 GAVAmbisonicAudio *gav_ambisonic_create(const char *sidecarPath)
@@ -259,64 +252,79 @@ GAVAmbisonicAudio *gav_ambisonic_create(const char *sidecarPath)
             return nullptr;
         }
 
-        NSArray<NSString *> *cachePaths = speakerCachePaths(sourcePath);
-        if (!buildSpeakerCache(sourcePath, cachePaths)) {
+        NSString *pcmPath = nativeCachePath(sourcePath);
+        if (!buildNativeCache(sourcePath, pcmPath)) {
+            return nullptr;
+        }
+
+        NSError *fileError = nil;
+        AVAudioFile *file = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:pcmPath]
+                                                          error:&fileError];
+        if (!file || file.processingFormat.channelCount != 4) {
+            std::fprintf(stderr,
+                         "[audio] native AmbiX cache is not four-channel: %s\n",
+                         fileError.localizedDescription.UTF8String ?: "invalid format");
+            return nullptr;
+        }
+
+        const AudioChannelLayoutTag hoaTag = kAudioChannelLayoutTag_HOA_ACN_SN3D | 4;
+        AVAudioChannelLayout *hoaLayout = [[AVAudioChannelLayout alloc] initWithLayoutTag:hoaTag];
+        if (!hoaLayout) {
+            std::fprintf(stderr, "[audio] could not create ACN/SN3D FOA channel layout\n");
+            return nullptr;
+        }
+
+        AVAudioFormat *hoaFormat = [[AVAudioFormat alloc]
+            initWithCommonFormat:AVAudioPCMFormatFloat32
+                      sampleRate:48000.0
+                     interleaved:NO
+                   channelLayout:hoaLayout];
+        if (!hoaFormat || hoaFormat.channelCount != 4) {
+            std::fprintf(stderr, "[audio] could not create four-channel FOA processing format\n");
             return nullptr;
         }
 
         GAVAmbisonicState *state = [[GAVAmbisonicState alloc] init];
         state.sourcePath = sourcePath;
+        state.pcmPath = pcmPath;
+        state.file = file;
+        state.ambisonicFormat = hoaFormat;
         state.engine = [[AVAudioEngine alloc] init];
         state.environment = [[AVAudioEnvironmentNode alloc] init];
+        state.player = [[AVAudioPlayerNode alloc] init];
+
         [state.engine attachNode:state.environment];
+        [state.engine attachNode:state.player];
+        [state.engine connect:state.player to:state.environment format:hoaFormat];
         [state.engine connect:state.environment to:state.engine.mainMixerNode format:nil];
+
         state.environment.outputType = AVAudioEnvironmentOutputTypeHeadphones;
         state.environment.listenerPosition = AVAudioMake3DPoint(0.0f, 0.0f, 0.0f);
+        state.player.renderingAlgorithm = AVAudio3DMixingRenderingAlgorithmAuto;
+        state.player.sourceMode = AVAudio3DMixingSourceModeAmbienceBed;
+        state.player.reverbBlend = 0.0f;
+        // The ambience-bed direction controls the bed's rotation in world space.
+        // Point it along AVAudioEnvironmentNode's default forward axis so that
+        // the ACN/SN3D field is unrotated at the initial headset pose.
+        state.player.position = AVAudioMake3DPoint(0.0f, 0.0f, -1.0f);
+        state.engine.mainMixerNode.outputVolume = 1.0f;
 
         if (!routeEngineToPSVR2(state.engine)) {
             return nullptr;
         }
 
-        NSMutableArray<AVAudioPlayerNode *> *players = [NSMutableArray arrayWithCapacity:kSpeakerCount];
-        NSMutableArray<AVAudioFile *> *files = [NSMutableArray arrayWithCapacity:kSpeakerCount];
-        for (NSUInteger i = 0; i < kSpeakerCount; ++i) {
-            NSError *fileError = nil;
-            AVAudioFile *file = [[AVAudioFile alloc] initForReading:[NSURL fileURLWithPath:cachePaths[i]]
-                                                              error:&fileError];
-            if (!file || file.processingFormat.channelCount != 1) {
-                std::fprintf(stderr,
-                             "[audio] could not open mono ambisonic cache %s: %s\n",
-                             cachePaths[i].UTF8String,
-                             fileError.localizedDescription.UTF8String ?: "invalid mono format");
-                return nullptr;
-            }
-
-            AVAudioPlayerNode *player = [[AVAudioPlayerNode alloc] init];
-            player.renderingAlgorithm = AVAudio3DMixingRenderingAlgorithmHRTF;
-            player.sourceMode = AVAudio3DMixingSourceModeSpatializeIfMono;
-            player.reverbBlend = 0.0f;
-            [state.engine attachNode:player];
-            [state.engine connect:player to:state.environment format:file.processingFormat];
-            [players addObject:player];
-            [files addObject:file];
-        }
-        state.players = players;
-        state.files = files;
-        setDefaultSpeakerPositions(state);
-        state.engine.mainMixerNode.outputVolume = 1.0f;
-
         [state.engine prepare];
         NSError *engineError = nil;
         if (![state.engine startAndReturnError:&engineError]) {
             std::fprintf(stderr,
-                         "[audio] could not start ambisonic AVAudioEngine: %s\n",
+                         "[audio] could not start native Ambisonic AVAudioEngine: %s\n",
                          engineError.localizedDescription.UTF8String ?: "unknown error");
             return nullptr;
         }
 
         auto *audio = new GAVAmbisonicAudio{};
         audio->retainedState = (__bridge_retained void *)state;
-        std::printf("[audio] head-tracked AmbiX enabled (6 virtual speakers, macOS HRTF)\n");
+        std::printf("[audio] native head-tracked AmbiX enabled (ACN/SN3D -> Apple binaural renderer)\n");
         return audio;
     }
 }
@@ -328,9 +336,7 @@ void gav_ambisonic_destroy(GAVAmbisonicAudio *audio)
     }
     @autoreleasepool {
         GAVAmbisonicState *state = stateFor(audio);
-        for (AVAudioPlayerNode *player in state.players) {
-            [player stop];
-        }
+        [state.player stop];
         [state.engine stop];
         if (audio->retainedState) {
             id releasedState = CFBridgingRelease(audio->retainedState);
@@ -346,38 +352,35 @@ bool gav_ambisonic_schedule(GAVAmbisonicAudio *audio,
                             uint64_t *hostTimeOut)
 {
     GAVAmbisonicState *state = stateFor(audio);
-    if (!state || state.files.count != kSpeakerCount || state.players.count != kSpeakerCount) {
+    if (!state || !state.file || !state.player) {
         return false;
     }
 
     mediaTimeSeconds = std::max(0.0, mediaTimeSeconds);
-    const double sampleRate = state.files[0].processingFormat.sampleRate;
+    const double sampleRate = state.file.processingFormat.sampleRate;
     const AVAudioFramePosition startFrame =
         static_cast<AVAudioFramePosition>(std::llround(mediaTimeSeconds * sampleRate));
 
-    for (NSUInteger i = 0; i < kSpeakerCount; ++i) {
-        AVAudioPlayerNode *player = state.players[i];
-        AVAudioFile *file = state.files[i];
-        [player stop];
-        if (startFrame >= file.length) {
-            return false;
-        }
-        const AVAudioFramePosition remaining = file.length - startFrame;
-        const AVAudioFrameCount frameCount = static_cast<AVAudioFrameCount>(
-            std::min<AVAudioFramePosition>(remaining,
-                                           static_cast<AVAudioFramePosition>(UINT32_MAX)));
-        [player scheduleSegment:file
-                  startingFrame:startFrame
-                     frameCount:frameCount
-                         atTime:nil
-              completionHandler:nil];
+    [state.player stop];
+    if (startFrame >= state.file.length) {
+        return false;
     }
+
+    const AVAudioFramePosition remaining = state.file.length - startFrame;
+    const AVAudioFrameCount frameCount = static_cast<AVAudioFrameCount>(
+        std::min<AVAudioFramePosition>(remaining,
+                                       static_cast<AVAudioFramePosition>(UINT32_MAX)));
+    [state.player scheduleSegment:state.file
+                   startingFrame:startFrame
+                      frameCount:frameCount
+                          atTime:nil
+               completionHandler:nil];
 
     if (!state.engine.isRunning) {
         NSError *error = nil;
         if (![state.engine startAndReturnError:&error]) {
             std::fprintf(stderr,
-                         "[audio] failed to restart ambisonic engine: %s\n",
+                         "[audio] failed to restart native Ambisonic engine: %s\n",
                          error.localizedDescription.UTF8String ?: "unknown error");
             return false;
         }
@@ -387,9 +390,8 @@ bool gav_ambisonic_schedule(GAVAmbisonicAudio *audio,
     const CMTime start = CMTimeAdd(now, CMTimeMakeWithSeconds(0.100, 1000000000));
     const uint64_t hostTime = CMClockConvertHostTimeToSystemUnits(start);
     AVAudioTime *audioStart = [AVAudioTime timeWithHostTime:hostTime];
-    for (AVAudioPlayerNode *player in state.players) {
-        [player playAtTime:audioStart];
-    }
+    [state.player playAtTime:audioStart];
+
     if (hostTimeOut) {
         *hostTimeOut = hostTime;
     }
@@ -399,21 +401,17 @@ bool gav_ambisonic_schedule(GAVAmbisonicAudio *audio,
 void gav_ambisonic_pause(GAVAmbisonicAudio *audio)
 {
     GAVAmbisonicState *state = stateFor(audio);
-    if (!state) {
-        return;
-    }
-    for (AVAudioPlayerNode *player in state.players) {
-        [player pause];
+    if (state) {
+        [state.player pause];
     }
 }
 
 void gav_ambisonic_set_volume(GAVAmbisonicAudio *audio, float volume)
 {
     GAVAmbisonicState *state = stateFor(audio);
-    if (!state) {
-        return;
+    if (state) {
+        state.engine.mainMixerNode.outputVolume = std::clamp(volume, 0.0f, 1.0f);
     }
-    state.engine.mainMixerNode.outputVolume = std::clamp(volume, 0.0f, 1.0f);
 }
 
 void gav_ambisonic_set_scene_basis(GAVAmbisonicAudio *audio,
@@ -421,17 +419,23 @@ void gav_ambisonic_set_scene_basis(GAVAmbisonicAudio *audio,
                                    float upX, float upY, float upZ,
                                    float forwardX, float forwardY, float forwardZ)
 {
-    GAVAmbisonicState *state = stateFor(audio);
-    if (!state || state.players.count != kSpeakerCount) {
+    if (!audio) {
         return;
     }
 
-    state.players[SpeakerFront].position = AVAudioMake3DPoint(forwardX, forwardY, forwardZ);
-    state.players[SpeakerBack].position = AVAudioMake3DPoint(-forwardX, -forwardY, -forwardZ);
-    state.players[SpeakerLeft].position = AVAudioMake3DPoint(-rightX, -rightY, -rightZ);
-    state.players[SpeakerRight].position = AVAudioMake3DPoint(rightX, rightY, rightZ);
-    state.players[SpeakerUp].position = AVAudioMake3DPoint(upX, upY, upZ);
-    state.players[SpeakerDown].position = AVAudioMake3DPoint(-upX, -upY, -upZ);
+    audio->sceneRight[0] = rightX;
+    audio->sceneRight[1] = rightY;
+    audio->sceneRight[2] = rightZ;
+    audio->sceneUp[0] = upX;
+    audio->sceneUp[1] = upY;
+    audio->sceneUp[2] = upZ;
+    audio->sceneForward[0] = forwardX;
+    audio->sceneForward[1] = forwardY;
+    audio->sceneForward[2] = forwardZ;
+    normalize3(audio->sceneRight);
+    normalize3(audio->sceneUp);
+    normalize3(audio->sceneForward);
+    audio->sceneBasisValid = true;
 }
 
 void gav_ambisonic_set_head_orientation(GAVAmbisonicAudio *audio,
@@ -446,7 +450,24 @@ void gav_ambisonic_set_head_orientation(GAVAmbisonicAudio *audio,
     float ux, uy, uz;
     rotateVector(*orientation, 0.0f, 0.0f, -1.0f, fx, fy, fz);
     rotateVector(*orientation, 0.0f, 1.0f, 0.0f, ux, uy, uz);
-    state.environment.listenerVectorOrientation = AVAudioMake3DVectorOrientation(
-        AVAudioMake3DVector(fx, fy, fz),
-        AVAudioMake3DVector(ux, uy, uz));
+
+    if (audio->sceneBasisValid) {
+        // Express the current headset orientation in the coordinate system
+        // captured at recenter/initial gaze. In that local system +X is right,
+        // +Y is up and -Z is movie-forward, matching AVAudioEnvironmentNode.
+        const float localForwardX = dot3(fx, fy, fz, audio->sceneRight);
+        const float localForwardY = dot3(fx, fy, fz, audio->sceneUp);
+        const float localForwardZ = -dot3(fx, fy, fz, audio->sceneForward);
+        const float localUpX = dot3(ux, uy, uz, audio->sceneRight);
+        const float localUpY = dot3(ux, uy, uz, audio->sceneUp);
+        const float localUpZ = -dot3(ux, uy, uz, audio->sceneForward);
+
+        state.environment.listenerVectorOrientation = AVAudioMake3DVectorOrientation(
+            AVAudioMake3DVector(localForwardX, localForwardY, localForwardZ),
+            AVAudioMake3DVector(localUpX, localUpY, localUpZ));
+    } else {
+        state.environment.listenerVectorOrientation = AVAudioMake3DVectorOrientation(
+            AVAudioMake3DVector(fx, fy, fz),
+            AVAudioMake3DVector(ux, uy, uz));
+    }
 }
