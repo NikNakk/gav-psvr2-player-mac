@@ -200,10 +200,121 @@ findCachedAmbisonicFile(NSString *cacheDir, NSString *videoID)
 }
 
 static NSString *
+discoverMultichannelFormatID(NSString *inputString)
+{
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
+    task.arguments = @[
+        @"yt-dlp",
+        @"-J",
+        @"--no-playlist",
+        @"--no-warnings",
+        @"--extractor-args", @"youtube:player_client=default,web_embedded",
+        inputString,
+    ];
+
+    NSPipe *stdoutPipe = [NSPipe pipe];
+    task.standardOutput = stdoutPipe;
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
+
+    NSError *launchError = nil;
+    if (![task launchAndReturnError:&launchError]) {
+        if (std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[audio] could not launch yt-dlp format discovery: %s\n",
+                         launchError.localizedDescription.UTF8String ?: "unknown error");
+        }
+        return nil;
+    }
+
+    NSData *stdoutData = [[stdoutPipe fileHandleForReading] readDataToEndOfFile];
+    [task waitUntilExit];
+    if (task.terminationStatus != 0 || stdoutData.length == 0) {
+        return nil;
+    }
+
+    NSError *jsonError = nil;
+    id root = [NSJSONSerialization JSONObjectWithData:stdoutData options:0 error:&jsonError];
+    if (![root isKindOfClass:[NSDictionary class]]) {
+        if (std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[audio] could not parse yt-dlp format JSON: %s\n",
+                         jsonError.localizedDescription.UTF8String ?: "invalid JSON");
+        }
+        return nil;
+    }
+
+    NSArray *formats = ((NSDictionary *)root)[@"formats"];
+    if (![formats isKindOfClass:[NSArray class]]) {
+        return nil;
+    }
+
+    NSString *bestFormatID = nil;
+    NSInteger bestChannels = 0;
+    double bestBitrate = -1.0;
+
+    for (id value in formats) {
+        if (![value isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSDictionary *format = (NSDictionary *)value;
+        NSString *vcodec = [format[@"vcodec"] isKindOfClass:[NSString class]] ? format[@"vcodec"] : nil;
+        NSNumber *channelsNumber = [format[@"audio_channels"] isKindOfClass:[NSNumber class]] ? format[@"audio_channels"] : nil;
+        NSString *formatID = [format[@"format_id"] isKindOfClass:[NSString class]] ? format[@"format_id"] : nil;
+        if (![vcodec isEqualToString:@"none"] || !channelsNumber || formatID.length == 0) {
+            continue;
+        }
+
+        const NSInteger channels = channelsNumber.integerValue;
+        if (channels <= 2) {
+            continue;
+        }
+
+        double bitrate = -1.0;
+        NSNumber *abr = [format[@"abr"] isKindOfClass:[NSNumber class]] ? format[@"abr"] : nil;
+        NSNumber *tbr = [format[@"tbr"] isKindOfClass:[NSNumber class]] ? format[@"tbr"] : nil;
+        if (abr) {
+            bitrate = abr.doubleValue;
+        } else if (tbr) {
+            bitrate = tbr.doubleValue;
+        }
+
+        if (channels > bestChannels ||
+            (channels == bestChannels && bitrate > bestBitrate)) {
+            bestChannels = channels;
+            bestBitrate = bitrate;
+            bestFormatID = formatID;
+        }
+    }
+
+    if (bestFormatID && std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[audio] selected YouTube spatial format %s (%ld channels, %.1f kb/s)\n",
+                     bestFormatID.UTF8String ?: "<unknown>",
+                     static_cast<long>(bestChannels),
+                     bestBitrate);
+    }
+    return bestFormatID;
+}
+
+static NSString *
 downloadAmbisonicYouTubeFile(NSString *cacheDir, NSString *inputString)
 {
     const char *overrideValue = std::getenv("GAV_AMBISONIC_AUDIO");
     if (overrideValue && strcasecmp(overrideValue, "off") == 0) {
+        return nil;
+    }
+
+    if (std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[audio] checking YouTube for multichannel spatial audio...\n");
+    }
+
+    NSString *formatID = discoverMultichannelFormatID(inputString);
+    if (formatID.length == 0) {
+        if (std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[audio] YouTube exposes no >2-channel audio format; using stereo fallback\n");
+        }
         return nil;
     }
 
@@ -215,9 +326,9 @@ downloadAmbisonicYouTubeFile(NSString *cacheDir, NSString *inputString)
     task.arguments = @[
         @"yt-dlp",
         @"--no-playlist",
-        @"--quiet",
+        @"--no-warnings",
         @"--extractor-args", @"youtube:player_client=default,web_embedded",
-        @"--format", @"bestaudio[audio_channels>2]",
+        @"--format", formatID,
         @"--output", outputTemplate,
         @"--print", @"after_move:filepath",
         inputString,
@@ -227,15 +338,11 @@ downloadAmbisonicYouTubeFile(NSString *cacheDir, NSString *inputString)
     task.standardOutput = stdoutPipe;
     task.standardError = [NSFileHandle fileHandleWithNullDevice];
 
-    if (std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
-        std::fprintf(stderr, "[audio] checking YouTube for multichannel spatial audio...\n");
-    }
-
     NSError *launchError = nil;
     if (![task launchAndReturnError:&launchError]) {
         if (std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
             std::fprintf(stderr,
-                         "[audio] could not launch yt-dlp for spatial audio: %s\n",
+                         "[audio] could not launch yt-dlp spatial download: %s\n",
                          launchError.localizedDescription.UTF8String ?: "unknown error");
         }
         return nil;
@@ -246,7 +353,8 @@ downloadAmbisonicYouTubeFile(NSString *cacheDir, NSString *inputString)
     if (task.terminationStatus != 0) {
         if (std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
             std::fprintf(stderr,
-                         "[audio] YouTube exposes no >2-channel audio format; using stereo fallback\n");
+                         "[audio] yt-dlp failed downloading spatial format %s; using stereo fallback\n",
+                         formatID.UTF8String ?: "<unknown>");
         }
         return nil;
     }
