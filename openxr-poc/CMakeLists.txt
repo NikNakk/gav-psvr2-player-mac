@@ -65,24 +65,32 @@ find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
 find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
 find_library(METAL_FRAMEWORK Metal REQUIRED)
 
+function(configure_openxr_metal_target target)
+    target_compile_definitions(${target} PRIVATE
+        XR_USE_GRAPHICS_API_METAL
+        XR_EXTENSION_PROTOTYPES
+    )
+
+    target_compile_options(${target} PRIVATE
+        "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>"
+    )
+
+    target_link_libraries(${target} PRIVATE
+        OpenXR::openxr_loader
+        ${FOUNDATION_FRAMEWORK}
+        ${METAL_FRAMEWORK}
+    )
+endfunction()
+
 add_executable(gav-monado-poc main.mm)
-
-target_compile_definitions(gav-monado-poc PRIVATE
-    XR_USE_GRAPHICS_API_METAL
-    XR_EXTENSION_PROTOTYPES
-)
-
-target_compile_options(gav-monado-poc PRIVATE
-    "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>"
-)
-
+configure_openxr_metal_target(gav-monado-poc)
 target_link_libraries(gav-monado-poc PRIVATE
-    OpenXR::openxr_loader
-    ${FOUNDATION_FRAMEWORK}
     ${AVFOUNDATION_FRAMEWORK}
     ${COREVIDEO_FRAMEWORK}
     ${COREMEDIA_FRAMEWORK}
     ${COREGRAPHICS_FRAMEWORK}
     ${QUARTZCORE_FRAMEWORK}
-    ${METAL_FRAMEWORK}
 )
+
+add_executable(gav-monado-projection-test projection_test.mm)
+configure_openxr_metal_target(gav-monado-projection-test)
