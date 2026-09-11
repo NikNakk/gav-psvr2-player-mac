@@ -10,10 +10,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -152,8 +154,6 @@ struct SwapchainSize {
 
 SwapchainSize chooseSwapchainSize(CGSize videoSize, const XrSystemGraphicsProperties &limits)
 {
-    // Keep the first proof-of-concept deliberately modest. The decoded source can
-    // still be 4K; Metal downsamples it into this composition-layer texture.
     const double videoWidth = std::max(1.0, static_cast<double>(videoSize.width));
     const double videoHeight = std::max(1.0, static_cast<double>(videoSize.height));
 
@@ -240,18 +240,21 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
 void renderVideoFrame(id<MTLCommandQueue> commandQueue,
                       id<MTLRenderPipelineState> pipeline,
                       id<MTLTexture> target,
-                      id<MTLTexture> source)
+                      id<MTLTexture> source,
+                      bool testPattern)
 {
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = target;
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+    pass.colorAttachments[0].clearColor = testPattern
+        ? MTLClearColorMake(1.0, 0.0, 1.0, 1.0)
+        : MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
 
     id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
     id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
-    [encoder setRenderPipelineState:pipeline];
-    if (source) {
+    if (!testPattern && source) {
+        [encoder setRenderPipelineState:pipeline];
         [encoder setFragmentTexture:source atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
@@ -259,9 +262,27 @@ void renderVideoFrame(id<MTLCommandQueue> commandQueue,
     [commandBuffer commit];
 
     // Intentionally conservative for the first POC: don't release the OpenXR
-    // image until Metal has finished writing it. We can remove this blocking wait
-    // once the basic playback path is proven.
+    // image until Metal has finished writing it.
     [commandBuffer waitUntilCompleted];
+    if (commandBuffer.status == MTLCommandBufferStatusError) {
+        throw std::runtime_error(std::string("Metal command buffer failed: ") +
+                                 (commandBuffer.error.localizedDescription.UTF8String ?: "unknown error"));
+    }
+}
+
+void printPixelFormat(OSType format)
+{
+    char fourcc[5] = {
+        static_cast<char>((format >> 24) & 0xff),
+        static_cast<char>((format >> 16) & 0xff),
+        static_cast<char>((format >> 8) & 0xff),
+        static_cast<char>(format & 0xff),
+        '\0',
+    };
+    for (int i = 0; i < 4; ++i) {
+        if (fourcc[i] < 32 || fourcc[i] > 126) fourcc[i] = '?';
+    }
+    std::printf("0x%08x ('%s')", static_cast<unsigned int>(format), fourcc);
 }
 
 } // namespace
@@ -276,6 +297,7 @@ int main(int argc, const char *argv[])
 
         std::signal(SIGINT, handleSignal);
         std::signal(SIGTERM, handleSignal);
+        const bool testPattern = std::getenv("GAV_MONADO_TEST_PATTERN") != nullptr;
 
         XrInstance instance = XR_NULL_HANDLE;
         XrSession session = XR_NULL_HANDLE;
@@ -418,6 +440,14 @@ int main(int argc, const char *argv[])
                             &swapchainImageCount,
                             reinterpret_cast<XrSwapchainImageBaseHeader *>(swapchainImages.data())),
                         "xrEnumerateSwapchainImages(list)");
+                if (swapchainImages.empty()) {
+                    throw std::runtime_error("OpenXR swapchain contains no images");
+                }
+
+                id<MTLTexture> firstTexture = (__bridge id<MTLTexture>)swapchainImages[0].texture;
+                if (!firstTexture) {
+                    throw std::runtime_error("OpenXR returned a null Metal swapchain texture");
+                }
 
                 id<MTLRenderPipelineState> pipeline = makePipeline(device, swapchainFormat);
                 const XrEnvironmentBlendMode blendMode = chooseBlendMode(instance, systemId);
@@ -441,11 +471,25 @@ int main(int argc, const char *argv[])
                             swapchainSize.height,
                             panelWidth,
                             panelHeight);
+                std::printf("Swapchain Metal texture: %lux%lu format=%lu usage=0x%lx storageMode=%lu images=%u\n",
+                            static_cast<unsigned long>(firstTexture.width),
+                            static_cast<unsigned long>(firstTexture.height),
+                            static_cast<unsigned long>(firstTexture.pixelFormat),
+                            static_cast<unsigned long>(firstTexture.usage),
+                            static_cast<unsigned long>(firstTexture.storageMode),
+                            swapchainImageCount);
+                if (testPattern) {
+                    std::printf("DIAGNOSTIC: GAV_MONADO_TEST_PATTERN enabled; swapchain will be cleared BRIGHT MAGENTA.\n");
+                    std::printf("DIAGNOSTIC: If the headset is still black, AVFoundation and the video shader are ruled out.\n");
+                }
                 std::printf("Audio follows the current macOS default output in this POC. Ctrl-C exits.\n");
 
                 bool sessionRunning = false;
                 bool exitRequested = false;
                 XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
+                uint64_t decodedFrameCount = 0;
+                bool loggedFirstDecodedFrame = false;
+                double lastStatusLog = CACurrentMediaTime();
 
                 while (!exitRequested && !gStopRequested.load()) {
                     XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
@@ -503,6 +547,16 @@ int main(int argc, const char *argv[])
                                     CVPixelBufferRelease(currentPixelBuffer);
                                 }
                                 currentPixelBuffer = newBuffer;
+                                ++decodedFrameCount;
+
+                                if (!loggedFirstDecodedFrame) {
+                                    loggedFirstDecodedFrame = true;
+                                    const size_t w = CVPixelBufferGetWidth(currentPixelBuffer);
+                                    const size_t h = CVPixelBufferGetHeight(currentPixelBuffer);
+                                    std::printf("DIAGNOSTIC: first decoded AVPlayer frame: %zux%zu pixelFormat=", w, h);
+                                    printPixelFormat(CVPixelBufferGetPixelFormatType(currentPixelBuffer));
+                                    std::printf("\n");
+                                }
                             }
                         }
 
@@ -518,10 +572,14 @@ int main(int argc, const char *argv[])
 
                         id<MTLTexture> target =
                             (__bridge id<MTLTexture>)swapchainImages[imageIndex].texture;
+                        if (!target) {
+                            throw std::runtime_error("Acquired OpenXR swapchain image has null Metal texture");
+                        }
+
                         id<MTLTexture> source = nil;
                         CVMetalTextureRef cvTexture = nullptr;
 
-                        if (currentPixelBuffer) {
+                        if (!testPattern && currentPixelBuffer) {
                             const size_t sourceWidth = CVPixelBufferGetWidth(currentPixelBuffer);
                             const size_t sourceHeight = CVPixelBufferGetHeight(currentPixelBuffer);
                             const CVReturn textureResult = CVMetalTextureCacheCreateTextureFromImage(
@@ -536,10 +594,14 @@ int main(int argc, const char *argv[])
                                 &cvTexture);
                             if (textureResult == kCVReturnSuccess && cvTexture) {
                                 source = CVMetalTextureGetTexture(cvTexture);
+                            } else if (textureResult != kCVReturnSuccess) {
+                                std::fprintf(stderr,
+                                             "DIAGNOSTIC: CVMetalTextureCacheCreateTextureFromImage failed: %d\n",
+                                             static_cast<int>(textureResult));
                             }
                         }
 
-                        renderVideoFrame(commandQueue, pipeline, target, source);
+                        renderVideoFrame(commandQueue, pipeline, target, source, testPattern);
                         if (cvTexture) {
                             CFRelease(cvTexture);
                         }
@@ -572,6 +634,30 @@ int main(int argc, const char *argv[])
                     endInfo.layerCount = layerCount;
                     endInfo.layers = layerCount ? layers : nullptr;
                     checkXr(xrEndFrame(session, &endInfo), "xrEndFrame");
+
+                    const double now = CACurrentMediaTime();
+                    if (now - lastStatusLog >= 2.0) {
+                        const double mediaSeconds = CMTimeGetSeconds(player.currentTime);
+                        const char *itemStatus = "unknown";
+                        switch (playerItem.status) {
+                            case AVPlayerItemStatusUnknown: itemStatus = "unknown"; break;
+                            case AVPlayerItemStatusReadyToPlay: itemStatus = "ready"; break;
+                            case AVPlayerItemStatusFailed: itemStatus = "failed"; break;
+                        }
+                        std::printf("DIAGNOSTIC: player status=%s rate=%.2f time=%.3fs decodedFrames=%llu currentPixelBuffer=%s shouldRender=%s\n",
+                                    itemStatus,
+                                    player.rate,
+                                    mediaSeconds,
+                                    static_cast<unsigned long long>(decodedFrameCount),
+                                    currentPixelBuffer ? "yes" : "no",
+                                    frameState.shouldRender ? "yes" : "no");
+                        if (playerItem.status == AVPlayerItemStatusFailed && playerItem.error) {
+                            std::fprintf(stderr,
+                                         "DIAGNOSTIC: AVPlayerItem error: %s\n",
+                                         playerItem.error.localizedDescription.UTF8String);
+                        }
+                        lastStatusLog = now;
+                    }
                 }
 
                 [player pause];
