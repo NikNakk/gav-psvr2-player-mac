@@ -98,6 +98,43 @@ findCachedYouTubeFile(NSString *cacheDir, NSString *videoID)
     return fallback;
 }
 
+static NSInteger
+audioChannelCountForFile(NSString *path)
+{
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
+    task.arguments = @[
+        @"ffprobe",
+        @"-v", @"error",
+        @"-select_streams", @"a:0",
+        @"-show_entries", @"stream=channels",
+        @"-of", @"default=noprint_wrappers=1:nokey=1",
+        path,
+    ];
+
+    NSPipe *stdoutPipe = [NSPipe pipe];
+    task.standardOutput = stdoutPipe;
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
+
+    NSError *launchError = nil;
+    if (![task launchAndReturnError:&launchError]) {
+        return -1;
+    }
+
+    NSData *stdoutData = [[stdoutPipe fileHandleForReading] readDataToEndOfFile];
+    [task waitUntilExit];
+    if (task.terminationStatus != 0) {
+        return -1;
+    }
+
+    NSString *stdoutText = [[NSString alloc] initWithData:stdoutData encoding:NSUTF8StringEncoding];
+    NSString *trimmed = [stdoutText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) {
+        return 0;
+    }
+    return trimmed.integerValue;
+}
+
 static NSString *
 findCachedAmbisonicFile(NSString *cacheDir, NSString *videoID)
 {
@@ -125,14 +162,44 @@ findCachedAmbisonicFile(NSString *cacheDir, NSString *videoID)
 
     NSString *needle = [NSString stringWithFormat:@"[%@]", videoID];
     NSSet<NSString *> *extensions = [NSSet setWithArray:@[@"webm", @"mka", @"opus", @"ogg", @"m4a", @"mp4"]];
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+
     for (NSString *entry in entries) {
-        NSString *lower = entry.lowercaseString;
         if (![entry containsString:needle] ||
-            ![lower containsString:@"ambisonic"] ||
             ![extensions containsObject:entry.pathExtension.lowercaseString]) {
             continue;
         }
-        return [cacheDir stringByAppendingPathComponent:entry];
+        [candidates addObject:[cacheDir stringByAppendingPathComponent:entry]];
+    }
+
+    // Prefer the filename produced by our documented manual format-338 command,
+    // but verify its channel count so titles containing the word "Ambisonic"
+    // cannot make an ordinary stereo MP4 look like a sidecar.
+    NSString *explicitMarker = [[NSString stringWithFormat:@"%@ ambisonic.", needle] lowercaseString];
+    for (NSString *candidate in candidates) {
+        NSString *lower = candidate.lastPathComponent.lowercaseString;
+        if (![lower containsString:explicitMarker]) {
+            continue;
+        }
+        const NSInteger channels = audioChannelCountForFile(candidate);
+        if (channels > 2 || channels < 0) {
+            return candidate;
+        }
+    }
+
+    // Fall back to inspecting every cached file for the same YouTube ID. This
+    // handles renamed/manual sidecars and avoids depending on yt-dlp's filename.
+    for (NSString *candidate in candidates) {
+        if (audioChannelCountForFile(candidate) > 2) {
+            return candidate;
+        }
+    }
+
+    if (std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[audio] no >2-channel cached sidecar found for YouTube ID %s in %s\n",
+                     videoID.UTF8String ?: "<unknown>",
+                     cacheDir.UTF8String ?: "<unknown>");
     }
     return nil;
 }
