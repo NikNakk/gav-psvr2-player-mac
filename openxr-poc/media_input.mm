@@ -19,6 +19,83 @@ isHttpURL(const char *input)
     return std::strncmp(input, "http://", 7) == 0 || std::strncmp(input, "https://", 8) == 0;
 }
 
+static NSString *
+youtubeVideoID(NSString *urlString)
+{
+    NSURLComponents *components = [NSURLComponents componentsWithString:urlString];
+    if (!components) {
+        return nil;
+    }
+
+    NSString *host = components.host.lowercaseString ?: @"";
+    if ([host isEqualToString:@"youtu.be"] || [host hasSuffix:@".youtu.be"]) {
+        NSArray<NSString *> *parts = components.path.pathComponents;
+        for (NSString *part in parts) {
+            if (part.length > 0 && ![part isEqualToString:@"/"]) {
+                return part;
+            }
+        }
+    }
+
+    for (NSURLQueryItem *item in components.queryItems) {
+        if ([item.name isEqualToString:@"v"] && item.value.length > 0) {
+            return item.value;
+        }
+    }
+
+    NSArray<NSString *> *parts = components.path.pathComponents;
+    for (NSUInteger i = 0; i + 1 < parts.count; ++i) {
+        NSString *part = parts[i].lowercaseString;
+        if ([part isEqualToString:@"shorts"] ||
+            [part isEqualToString:@"embed"] ||
+            [part isEqualToString:@"live"]) {
+            NSString *candidate = parts[i + 1];
+            if (candidate.length > 0) {
+                return candidate;
+            }
+        }
+    }
+
+    return nil;
+}
+
+static bool
+filenameSuggestsEAC(NSString *path)
+{
+    NSString *upper = path.lastPathComponent.uppercaseString;
+    return [upper containsString:@"EAC360"] ||
+           ([upper containsString:@"360"] && ![upper containsString:@"180"]);
+}
+
+static NSString *
+findCachedYouTubeFile(NSString *cacheDir, NSString *videoID)
+{
+    if (videoID.length == 0) {
+        return nil;
+    }
+
+    NSError *error = nil;
+    NSArray<NSString *> *entries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:cacheDir error:&error];
+    if (!entries) {
+        return nil;
+    }
+
+    NSString *needle = [NSString stringWithFormat:@"[%@]", videoID];
+    NSString *fallback = nil;
+    for (NSString *entry in entries) {
+        if (![entry.pathExtension.lowercaseString isEqualToString:@"mp4"] ||
+            ![entry containsString:needle]) {
+            continue;
+        }
+        NSString *candidate = [cacheDir stringByAppendingPathComponent:entry];
+        if (filenameSuggestsEAC(candidate)) {
+            return candidate;
+        }
+        fallback = candidate;
+    }
+    return fallback;
+}
+
 GAVResolvedMediaInput
 gav_resolve_media_input(const char *input)
 {
@@ -46,6 +123,17 @@ gav_resolve_media_input(const char *input)
                                      (directoryError.localizedDescription.UTF8String ?: "unknown error"));
         }
 
+        NSString *inputString = [NSString stringWithUTF8String:input];
+        NSString *videoID = youtubeVideoID(inputString);
+        NSString *cachedPath = findCachedYouTubeFile(cacheDir, videoID);
+        if (cachedPath) {
+            const bool eacHint = filenameSuggestsEAC(cachedPath);
+            std::printf("[youtube] cache hit: %s%s\n",
+                        cachedPath.UTF8String,
+                        eacHint ? " (EAC360)" : "");
+            return {cachedPath.UTF8String, eacHint};
+        }
+
         NSString *outputTemplate = [cacheDir stringByAppendingPathComponent:
             @"%(title)s [YT] [%(id)s] [%(width)sx%(height)s].%(ext)s"];
 
@@ -60,7 +148,7 @@ gav_resolve_media_input(const char *input)
             @"--write-info-json",
             @"--output", outputTemplate,
             @"--print", @"after_move:filepath",
-            [NSString stringWithUTF8String:input],
+            inputString,
         ];
 
         NSPipe *stdoutPipe = [NSPipe pipe];
@@ -88,32 +176,9 @@ gav_resolve_media_input(const char *input)
             throw std::runtime_error("yt-dlp did not produce a playable local file");
         }
 
-        NSString *basename = resolvedPath.lastPathComponent;
-        NSString *upper = basename.uppercaseString;
-        bool eacHint = [upper containsString:@"EAC360"];
-
-        // Carry forward the youtube-vr-support branch convention: YouTube 360
-        // DASH downloads use EAC, and dimensions alone are not a reliable clue.
-        // Explicitly tag obvious 360 titles so the renderer can auto-select EAC.
-        if (!eacHint && [upper containsString:@"360"] && ![upper containsString:@"180"]) {
-            NSString *taggedName = [@"EAC360 " stringByAppendingString:basename];
-            NSString *taggedPath = [resolvedPath.stringByDeletingLastPathComponent stringByAppendingPathComponent:taggedName];
-            NSFileManager *fm = NSFileManager.defaultManager;
-            if ([fm fileExistsAtPath:taggedPath]) {
-                NSError *removeError = nil;
-                if (![fm removeItemAtPath:taggedPath error:&removeError]) {
-                    throw std::runtime_error(std::string("Could not replace cached YouTube EAC file: ") +
-                                             (removeError.localizedDescription.UTF8String ?: "unknown error"));
-                }
-            }
-            NSError *moveError = nil;
-            if (![fm moveItemAtPath:resolvedPath toPath:taggedPath error:&moveError]) {
-                throw std::runtime_error(std::string("Could not tag YouTube EAC file: ") +
-                                         (moveError.localizedDescription.UTF8String ?: "unknown error"));
-            }
-            resolvedPath = taggedPath;
-            eacHint = true;
-        }
+        // Keep yt-dlp's output filename intact so subsequent runs can reuse it.
+        // EAC is a playback hint, not part of the on-disk cache key.
+        const bool eacHint = filenameSuggestsEAC(resolvedPath);
 
         std::printf("[youtube] local file: %s%s\n",
                     resolvedPath.UTF8String,
