@@ -172,9 +172,6 @@ findCachedAmbisonicFile(NSString *cacheDir, NSString *videoID)
         [candidates addObject:[cacheDir stringByAppendingPathComponent:entry]];
     }
 
-    // Prefer the filename produced by our documented manual format-338 command,
-    // but verify its channel count so titles containing the word "Ambisonic"
-    // cannot make an ordinary stereo MP4 look like a sidecar.
     NSString *explicitMarker = [[NSString stringWithFormat:@"%@ ambisonic.", needle] lowercaseString];
     for (NSString *candidate in candidates) {
         NSString *lower = candidate.lastPathComponent.lowercaseString;
@@ -187,8 +184,6 @@ findCachedAmbisonicFile(NSString *cacheDir, NSString *videoID)
         }
     }
 
-    // Fall back to inspecting every cached file for the same YouTube ID. This
-    // handles renamed/manual sidecars and avoids depending on yt-dlp's filename.
     for (NSString *candidate in candidates) {
         if (audioChannelCountForFile(candidate) > 2) {
             return candidate;
@@ -202,6 +197,78 @@ findCachedAmbisonicFile(NSString *cacheDir, NSString *videoID)
                      cacheDir.UTF8String ?: "<unknown>");
     }
     return nil;
+}
+
+static NSString *
+downloadAmbisonicYouTubeFile(NSString *cacheDir, NSString *inputString)
+{
+    const char *overrideValue = std::getenv("GAV_AMBISONIC_AUDIO");
+    if (overrideValue && strcasecmp(overrideValue, "off") == 0) {
+        return nil;
+    }
+
+    NSString *outputTemplate = [cacheDir stringByAppendingPathComponent:
+        @"%(title)s [YT] [%(id)s] ambisonic.%(ext)s"];
+
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
+    task.arguments = @[
+        @"yt-dlp",
+        @"--no-playlist",
+        @"--quiet",
+        @"--extractor-args", @"youtube:player_client=default,web_embedded",
+        @"--format", @"bestaudio[audio_channels>2]",
+        @"--output", outputTemplate,
+        @"--print", @"after_move:filepath",
+        inputString,
+    ];
+
+    NSPipe *stdoutPipe = [NSPipe pipe];
+    task.standardOutput = stdoutPipe;
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
+
+    if (std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[audio] checking YouTube for multichannel spatial audio...\n");
+    }
+
+    NSError *launchError = nil;
+    if (![task launchAndReturnError:&launchError]) {
+        if (std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[audio] could not launch yt-dlp for spatial audio: %s\n",
+                         launchError.localizedDescription.UTF8String ?: "unknown error");
+        }
+        return nil;
+    }
+
+    NSData *stdoutData = [[stdoutPipe fileHandleForReading] readDataToEndOfFile];
+    [task waitUntilExit];
+    if (task.terminationStatus != 0) {
+        if (std::getenv("GAV_AMBISONIC_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[audio] YouTube exposes no >2-channel audio format; using stereo fallback\n");
+        }
+        return nil;
+    }
+
+    NSString *stdoutText = [[NSString alloc] initWithData:stdoutData encoding:NSUTF8StringEncoding];
+    NSString *path = [stdoutText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        return nil;
+    }
+
+    const NSInteger channels = audioChannelCountForFile(path);
+    if (channels <= 2) {
+        std::fprintf(stderr,
+                     "[audio] downloaded spatial-audio candidate has only %ld channels; using stereo fallback\n",
+                     static_cast<long>(channels));
+        return nil;
+    }
+
+    std::printf("[audio] downloaded %ld-channel sidecar: %s\n",
+                static_cast<long>(channels),
+                path.UTF8String ?: "<unknown>");
+    return path;
 }
 
 GAVResolvedMediaInput
@@ -239,6 +306,9 @@ gav_resolve_media_input(const char *input)
         NSString *inputString = [NSString stringWithUTF8String:input];
         NSString *videoID = youtubeVideoID(inputString);
         NSString *ambisonicPath = findCachedAmbisonicFile(cacheDir, videoID);
+        if (!ambisonicPath) {
+            ambisonicPath = downloadAmbisonicYouTubeFile(cacheDir, inputString);
+        }
         if (ambisonicPath) {
             std::printf("[audio] cached ambisonic sidecar: %s\n", ambisonicPath.UTF8String);
         }
