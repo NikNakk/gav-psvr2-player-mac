@@ -62,6 +62,8 @@ endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
+find_library(WEBKIT_FRAMEWORK WebKit REQUIRED)
 find_library(AVFOUNDATION_FRAMEWORK AVFoundation REQUIRED)
 find_library(AVFAUDIO_FRAMEWORK AVFAudio REQUIRED)
 find_library(AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
@@ -139,6 +141,8 @@ target_compile_definitions(gav-monado-poc PRIVATE
     GAV_ENABLE_YTDLP=$<BOOL:${GAV_ENABLE_YTDLP}>
 )
 target_link_libraries(gav-monado-poc PRIVATE
+    ${APPKIT_FRAMEWORK}
+    ${WEBKIT_FRAMEWORK}
     ${AVFOUNDATION_FRAMEWORK}
     ${AVFAUDIO_FRAMEWORK}
     ${AUDIOTOOLBOX_FRAMEWORK}

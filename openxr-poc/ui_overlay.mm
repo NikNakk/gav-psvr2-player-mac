@@ -1,8 +1,10 @@
+#import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreText/CoreText.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <WebKit/WebKit.h>
 
 #include "ui_overlay.h"
 
@@ -17,6 +19,7 @@ namespace {
 constexpr size_t kWidth = 1024;
 constexpr size_t kHeight = 512;
 constexpr int kPickerRows = 6;
+constexpr double kBrowserSnapshotInterval = 0.10;
 
 struct PickerEntry {
     std::string path;
@@ -189,6 +192,12 @@ std::string shortenedLabel(const std::string &text, NSUInteger maxCharacters)
 
 } // namespace
 
+struct GAVUIOverlay;
+
+@interface GAVYouTubeBridge : NSObject <WKScriptMessageHandler, WKNavigationDelegate>
+@property(nonatomic, assign) GAVUIOverlay *owner;
+@end
+
 struct GAVUIOverlay {
     __strong id<MTLTexture> texture{nil};
     std::vector<uint8_t> pixels;
@@ -199,18 +208,263 @@ struct GAVUIOverlay {
     bool playing{false};
     bool visible{false};
     bool pickerMode{false};
-    int controlSelection{1}; // Files, Play/Pause, Recenter
+    bool browserMode{false};
+    int controlSelection{2}; // Files, YouTube, Play/Pause, Recenter
     std::string pickerDir;
     std::vector<PickerEntry> pickerEntries;
     int pickerSelection{0};
     int pickerOffset{0};
     int pickerBottomSelection{-1}; // ▲, ▼, Drives, Cancel. -1 = file list
     std::string actionPath;
+
+    __strong WKWebView *browser{nil};
+    __strong NSWindow *browserWindow{nil};
+    __strong GAVYouTubeBridge *browserBridge{nil};
+    __strong NSImage *browserSnapshot{nil};
+    bool browserLoaded{false};
+    bool browserSnapshotPending{false};
+    bool browserNeedsSnapshot{false};
+    double lastBrowserSnapshot{0.0};
+    double lastBrowserScroll{0.0};
+    double browserCursorU{0.50};
+    double browserCursorV{0.50};
+    std::string pendingBrowserURL;
+
     bool dirty{true};
     double lastDraw{0.0};
 };
 
 static void redraw(GAVUIOverlay *ui);
+
+static void browserNeedsRefresh(GAVUIOverlay *ui)
+{
+    if (!ui) return;
+    ui->browserNeedsSnapshot = true;
+}
+
+static void browserLaunchRequested(GAVUIOverlay *ui, NSString *url)
+{
+    if (!ui || !url.length) return;
+    ui->pendingBrowserURL = url.UTF8String ?: "";
+    std::printf("[youtube-ui] Play in PSVR2 requested: %s\n",
+                ui->pendingBrowserURL.c_str());
+}
+
+@implementation GAVYouTubeBridge
+
+- (void)userContentController:(WKUserContentController *)userContentController
+      didReceiveScriptMessage:(WKScriptMessage *)message
+{
+    (void)userContentController;
+    if (![message.name isEqualToString:@"gavVR"]) return;
+    if ([message.body isKindOfClass:[NSString class]]) {
+        browserLaunchRequested(self.owner, (NSString *)message.body);
+    }
+}
+
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation
+{
+    (void)webView;
+    (void)navigation;
+    browserNeedsRefresh(self.owner);
+}
+
+- (void)webView:(WKWebView *)webView didCommitNavigation:(WKNavigation *)navigation
+{
+    (void)webView;
+    (void)navigation;
+    browserNeedsRefresh(self.owner);
+}
+
+@end
+
+static NSString *browserInjectionScript()
+{
+    return @R"JS(
+(() => {
+  const BUTTON_ID = 'gav-psvr2-play-button';
+  const install = () => {
+    document.querySelectorAll('video').forEach(v => { v.muted = true; v.pause(); });
+    const onVideo = location.pathname === '/watch' || location.pathname.startsWith('/shorts/');
+    let button = document.getElementById(BUTTON_ID);
+    if (!onVideo) {
+      if (button) button.remove();
+      return;
+    }
+    if (!button) {
+      button = document.createElement('button');
+      button.id = BUTTON_ID;
+      button.textContent = '🥽 Play in PSVR2';
+      Object.assign(button.style, {
+        position: 'fixed', right: '24px', bottom: '76px', zIndex: '2147483647',
+        border: '1px solid rgba(255,255,255,.32)', borderRadius: '14px',
+        padding: '13px 18px', color: 'white', background: 'rgba(92,107,242,.96)',
+        font: '600 16px -apple-system, BlinkMacSystemFont, sans-serif',
+        boxShadow: '0 8px 28px rgba(0,0,0,.38)', cursor: 'pointer'
+      });
+      button.addEventListener('click', ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        window.webkit.messageHandlers.gavVR.postMessage(location.href);
+      }, true);
+      document.documentElement.appendChild(button);
+    }
+  };
+  install();
+  new MutationObserver(install).observe(document.documentElement, {subtree:true, childList:true});
+  window.addEventListener('yt-navigate-finish', install, true);
+  setInterval(install, 1200);
+})();
+)JS";
+}
+
+static void ensureBrowser(GAVUIOverlay *ui)
+{
+    if (!ui || ui->browser) return;
+
+    [NSApplication sharedApplication];
+
+    WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
+    configuration.websiteDataStore = [WKWebsiteDataStore defaultDataStore];
+    configuration.mediaTypesRequiringUserActionForPlayback = WKAudiovisualMediaTypeAll;
+    configuration.allowsAirPlayForMediaPlayback = NO;
+
+    WKUserContentController *content = [[WKUserContentController alloc] init];
+    ui->browserBridge = [[GAVYouTubeBridge alloc] init];
+    ui->browserBridge.owner = ui;
+    [content addScriptMessageHandler:ui->browserBridge name:@"gavVR"];
+    [content addUserScript:[[WKUserScript alloc]
+        initWithSource:browserInjectionScript()
+        injectionTime:WKUserScriptInjectionTimeAtDocumentEnd
+        forMainFrameOnly:NO]];
+    configuration.userContentController = content;
+
+    ui->browser = [[WKWebView alloc]
+        initWithFrame:NSMakeRect(0, 0, kWidth, kHeight)
+        configuration:configuration];
+    ui->browser.navigationDelegate = ui->browserBridge;
+    ui->browser.allowsMagnification = NO;
+
+    // WebKit is hosted in a real off-screen window so it continues to render
+    // and can accept keyboard focus for YouTube's search field when requested.
+    ui->browserWindow = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(-20000, -20000, kWidth, kHeight)
+        styleMask:NSWindowStyleMaskTitled
+        backing:NSBackingStoreBuffered
+        defer:NO];
+    ui->browserWindow.releasedWhenClosed = NO;
+    ui->browserWindow.collectionBehavior =
+        NSWindowCollectionBehaviorTransient | NSWindowCollectionBehaviorIgnoresCycle;
+    ui->browserWindow.contentView = ui->browser;
+    [ui->browserWindow orderFront:nil];
+}
+
+static void openBrowser(GAVUIOverlay *ui)
+{
+    if (!ui) return;
+    ensureBrowser(ui);
+    if (!ui->browser) return;
+
+    ui->pickerMode = false;
+    ui->browserMode = true;
+    ui->browserCursorU = 0.50;
+    ui->browserCursorV = 0.50;
+    ui->browserNeedsSnapshot = true;
+    ui->dirty = true;
+
+    if (!ui->browserLoaded) {
+        ui->browserLoaded = true;
+        NSURL *url = [NSURL URLWithString:
+            @"https://www.youtube.com/results?search_query=VR180+8K"];
+        [ui->browser loadRequest:[NSURLRequest requestWithURL:url]];
+        std::printf("[youtube-ui] opened YouTube VR browser\n");
+    }
+}
+
+static void pumpBrowserRunLoop()
+{
+    // The OpenXR player owns the main thread rather than NSApplication.run(),
+    // so give WebKit/AppKit a non-blocking chance to process callbacks/events.
+    @autoreleasepool {
+        for (int i = 0; i < 4; ++i) {
+            NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                                untilDate:[NSDate date]
+                                                   inMode:NSDefaultRunLoopMode
+                                                  dequeue:YES];
+            if (!event) break;
+            [NSApp sendEvent:event];
+        }
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, true);
+    }
+}
+
+static void requestBrowserSnapshot(GAVUIOverlay *ui)
+{
+    if (!ui || !ui->browser || ui->browserSnapshotPending) return;
+    const double now = CACurrentMediaTime();
+    if (!ui->browserNeedsSnapshot && now - ui->lastBrowserSnapshot < kBrowserSnapshotInterval) {
+        return;
+    }
+
+    ui->browserNeedsSnapshot = false;
+    ui->browserSnapshotPending = true;
+    ui->lastBrowserSnapshot = now;
+    __weak GAVYouTubeBridge *weakBridge = ui->browserBridge;
+    [ui->browser takeSnapshotWithConfiguration:nil
+                             completionHandler:^(NSImage *image, NSError *error) {
+        GAVYouTubeBridge *bridge = weakBridge;
+        GAVUIOverlay *owner = bridge.owner;
+        if (!owner) return;
+        owner->browserSnapshotPending = false;
+        if (image) {
+            owner->browserSnapshot = image;
+            owner->dirty = true;
+        } else if (error) {
+            std::fprintf(stderr,
+                         "[youtube-ui] snapshot failed: %s\n",
+                         error.localizedDescription.UTF8String ?: "unknown error");
+        }
+    }];
+}
+
+static void browserClick(GAVUIOverlay *ui)
+{
+    if (!ui || !ui->browser) return;
+    const double x = ui->browserCursorU * static_cast<double>(kWidth);
+    const double y = ui->browserCursorV * static_cast<double>(kHeight);
+    NSString *script = [NSString stringWithFormat:
+        @"(() => { const e=document.elementFromPoint(%0.1f,%0.1f);"
+         "if(!e)return ''; if(e.focus)e.focus(); e.click();"
+         "return (e.tagName||'').toLowerCase(); })()", x, y];
+    __weak GAVYouTubeBridge *weakBridge = ui->browserBridge;
+    [ui->browser evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+        (void)error;
+        GAVYouTubeBridge *bridge = weakBridge;
+        GAVUIOverlay *owner = bridge.owner;
+        if (!owner) return;
+        owner->browserNeedsSnapshot = true;
+        if ([result isKindOfClass:[NSString class]]) {
+            NSString *tag = (NSString *)result;
+            if ([tag isEqualToString:@"input"] || [tag isEqualToString:@"textarea"]) {
+                [owner->browserWindow makeKeyAndOrderFront:nil];
+                [owner->browserWindow makeFirstResponder:owner->browser];
+                std::printf("[youtube-ui] keyboard focus sent to YouTube search field\n");
+            }
+        }
+    }];
+}
+
+static void browserScroll(GAVUIOverlay *ui, float rightY)
+{
+    if (!ui || !ui->browser || std::fabs(rightY) < 0.18f) return;
+    const double now = CACurrentMediaTime();
+    if (now - ui->lastBrowserScroll < 0.035) return;
+    ui->lastBrowserScroll = now;
+    const double amount = -static_cast<double>(rightY) * 110.0;
+    NSString *script = [NSString stringWithFormat:@"window.scrollBy(0,%0.1f);", amount];
+    [ui->browser evaluateJavaScript:script completionHandler:nil];
+    ui->browserNeedsSnapshot = true;
+}
 
 static void loadPickerDirectory(GAVUIOverlay *ui, const std::string &path)
 {
@@ -295,6 +549,7 @@ static void openPicker(GAVUIOverlay *ui)
             start = NSHomeDirectory();
         }
     }
+    ui->browserMode = false;
     ui->pickerMode = true;
     loadPickerDirectory(ui, start.UTF8String ?: NSHomeDirectory().UTF8String);
 }
@@ -362,8 +617,7 @@ static void drawControls(GAVUIOverlay *ui, CGContextRef ctx)
     const CGFloat buttonW = 232.0;
     const CGFloat buttonH = 100.0;
     const CGFloat gap = 16.0;
-    const CGFloat totalW = buttonW * 3.0 + gap * 2.0;
-    const CGFloat x0 = (static_cast<CGFloat>(kWidth) - totalW) * 0.5;
+    const CGFloat x0 = 24.0;
     const CGFloat y = 116.0;
 
     const struct {
@@ -371,16 +625,17 @@ static void drawControls(GAVUIOverlay *ui, CGContextRef ctx)
         int actionIndex;
     } buttons[] = {
         {"Files", 0},
-        {ui->playing ? "❚❚ Pause" : "▶ Play", 1},
-        {"Recenter", 2},
+        {"YouTube", 1},
+        {ui->playing ? "❚❚ Pause" : "▶ Play", 2},
+        {"Recenter", 3},
     };
 
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         drawButton(ctx,
                    CGRectMake(x0 + i * (buttonW + gap), y, buttonW, buttonH),
                    buttons[i].label,
                    ui->controlSelection == buttons[i].actionIndex,
-                   32);
+                   i == 1 ? 29 : 31);
     }
 
     drawCenteredText(ctx,
@@ -457,6 +712,41 @@ static void drawPicker(GAVUIOverlay *ui, CGContextRef ctx)
     }
 }
 
+static void drawBrowser(GAVUIOverlay *ui, CGContextRef ctx)
+{
+    if (ui->browserSnapshot) {
+        NSGraphicsContext *graphics = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:NO];
+        [NSGraphicsContext saveGraphicsState];
+        [NSGraphicsContext setCurrentContext:graphics];
+        [ui->browserSnapshot drawInRect:NSMakeRect(0, 0, kWidth, kHeight)
+                               fromRect:NSZeroRect
+                              operation:NSCompositingOperationCopy
+                               fraction:1.0];
+        [NSGraphicsContext restoreGraphicsState];
+    } else {
+        fillRounded(ctx, CGRectMake(4, 4, kWidth - 8, kHeight - 8), 28,
+                    0.07, 0.08, 0.10, 0.94);
+        drawCenteredText(ctx, "Loading YouTube VR…",
+                         CGRectMake(150, 206, 724, 100), 32);
+    }
+
+    // A small GAV-style glass hint plate, plus a crisp native cursor rendered
+    // after the WebKit snapshot so controller targeting stays easy to see.
+    const CGRect hint = CGRectMake(18, 462, kWidth - 36, 38);
+    fillRounded(ctx, hint, 12, 0.07, 0.08, 0.10, 0.82);
+    drawCenteredText(ctx,
+                     "D-pad: cursor   Cross: click   Right stick: scroll   Circle: back   Menu: close",
+                     hint, 15, 0.92, 0.93, 0.96);
+
+    const CGFloat cursorX = static_cast<CGFloat>(ui->browserCursorU * kWidth);
+    const CGFloat cursorY = static_cast<CGFloat>((1.0 - ui->browserCursorV) * kHeight);
+    setFill(ctx, 1.0, 1.0, 1.0, 1.0);
+    CGContextFillEllipseInRect(ctx, CGRectMake(cursorX - 8, cursorY - 8, 16, 16));
+    CGContextSetRGBStrokeColor(ctx, 0.36, 0.42, 0.95, 1.0);
+    CGContextSetLineWidth(ctx, 4.0);
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(cursorX - 12, cursorY - 12, 24, 24));
+}
+
 static void redraw(GAVUIOverlay *ui)
 {
     if (!ui || !ui->texture) return;
@@ -478,14 +768,15 @@ static void redraw(GAVUIOverlay *ui)
 
     CGContextClearRect(ctx, CGRectMake(0, 0, kWidth, kHeight));
 
-    // Match the original GAV overlay's glass-like plate. CoreGraphics stores
-    // premultiplied alpha here; the Metal shader composites it over video.
-    const CGRect plate = CGRectMake(4, 4, kWidth - 8, kHeight - 8);
-    fillRounded(ctx, plate, 28, 0.07, 0.08, 0.10, 0.84);
-    strokeRounded(ctx, plate, 28, 1.0, 1.0, 1.0, 0.11, 1.2);
-
-    if (ui->pickerMode) drawPicker(ui, ctx);
-    else drawControls(ui, ctx);
+    if (ui->browserMode) {
+        drawBrowser(ui, ctx);
+    } else {
+        const CGRect plate = CGRectMake(4, 4, kWidth - 8, kHeight - 8);
+        fillRounded(ctx, plate, 28, 0.07, 0.08, 0.10, 0.84);
+        strokeRounded(ctx, plate, 28, 1.0, 1.0, 1.0, 0.11, 1.2);
+        if (ui->pickerMode) drawPicker(ui, ctx);
+        else drawControls(ui, ctx);
+    }
 
     CGContextRelease(ctx);
 
@@ -515,12 +806,24 @@ GAVUIOverlay *gav_ui_create(id<MTLDevice> device, const char *currentPath)
     ui->pixels.resize(kWidth * kHeight * 4);
     gav_ui_set_current_path(ui, currentPath);
     redraw(ui);
-    std::printf("[ui] Menu/Options opens player controls and file browser\n");
+    std::printf("[ui] Menu/Options opens player controls, files and YouTube VR browser\n");
     return ui;
 }
 
 void gav_ui_destroy(GAVUIOverlay *ui)
 {
+    if (!ui) return;
+    if (ui->browserBridge) {
+        ui->browserBridge.owner = nullptr;
+    }
+    if (ui->browser) {
+        [ui->browser.configuration.userContentController removeScriptMessageHandlerForName:@"gavVR"];
+        ui->browser.navigationDelegate = nil;
+    }
+    if (ui->browserWindow) {
+        [ui->browserWindow orderOut:nil];
+        ui->browserWindow.contentView = nil;
+    }
     delete ui;
 }
 
@@ -535,6 +838,7 @@ void gav_ui_set_current_path(GAVUIOverlay *ui, const char *path)
     ui->currentPath = path ? path : "";
     ui->currentName = basenameForPath(ui->currentPath);
     ui->pickerMode = false;
+    ui->browserMode = false;
     ui->pickerBottomSelection = -1;
     ui->dirty = true;
 }
@@ -548,9 +852,14 @@ void gav_ui_update(GAVUIOverlay *ui,
     ui->currentSeconds = std::isfinite(currentSeconds) ? currentSeconds : 0.0;
     ui->durationSeconds = std::isfinite(durationSeconds) ? durationSeconds : 0.0;
     ui->playing = playing != 0;
-    if (ui->visible && CACurrentMediaTime() - ui->lastDraw >= 0.10) {
+
+    if (ui->browserMode) {
+        pumpBrowserRunLoop();
+        requestBrowserSnapshot(ui);
+    } else if (ui->visible && CACurrentMediaTime() - ui->lastDraw >= 0.10) {
         ui->dirty = true;
     }
+
     if (ui->dirty) redraw(ui);
 }
 
@@ -566,9 +875,26 @@ int gav_ui_process_controller(GAVUIOverlay *ui,
     if (action) *action = {GAV_UI_ACTION_NONE, nullptr};
     if (!ui || !snapshot) return 0;
 
+    if (!ui->pendingBrowserURL.empty() && action) {
+        ui->actionPath = ui->pendingBrowserURL;
+        ui->pendingBrowserURL.clear();
+        action->type = GAV_UI_ACTION_OPEN_PATH;
+        action->path = ui->actionPath.c_str();
+        ui->browserMode = false;
+        ui->visible = false;
+        if (ui->browserWindow) [ui->browserWindow orderOut:nil];
+        ui->dirty = true;
+        return 1;
+    }
+
     if ((snapshot->uiToggle & 1) != 0) {
         ui->visible = !ui->visible;
-        if (ui->visible) ui->pickerMode = false;
+        if (ui->visible) {
+            ui->pickerMode = false;
+            ui->browserMode = false;
+        } else if (ui->browserWindow) {
+            [ui->browserWindow orderOut:nil];
+        }
         ui->pickerBottomSelection = -1;
         ui->dirty = true;
         redraw(ui);
@@ -576,6 +902,33 @@ int gav_ui_process_controller(GAVUIOverlay *ui,
     }
 
     if (!ui->visible) return 0;
+
+    if (ui->browserMode) {
+        browserScroll(ui, snapshot->rightY);
+
+        if (snapshot->uiNavX != 0 || snapshot->uiNavY != 0) {
+            ui->browserCursorU = std::clamp(
+                ui->browserCursorU + 0.075 * snapshot->uiNavX, 0.025, 0.975);
+            ui->browserCursorV = std::clamp(
+                ui->browserCursorV + 0.10 * snapshot->uiNavY, 0.04, 0.96);
+            ui->dirty = true;
+        }
+        if (snapshot->uiSelect != 0) {
+            browserClick(ui);
+        }
+        if (snapshot->uiBack != 0) {
+            if (ui->browser && ui->browser.canGoBack) {
+                [ui->browser goBack];
+                ui->browserNeedsSnapshot = true;
+            } else {
+                ui->browserMode = false;
+                if (ui->browserWindow) [ui->browserWindow orderOut:nil];
+                ui->dirty = true;
+            }
+        }
+        if (ui->dirty) redraw(ui);
+        return 1;
+    }
 
     if (snapshot->uiBack != 0) {
         if (ui->pickerMode) {
@@ -594,8 +947,6 @@ int gav_ui_process_controller(GAVUIOverlay *ui,
 
         if (snapshot->uiNavX != 0) {
             if (ui->pickerBottomSelection < 0) {
-                // The original GAV panel keeps Drives permanently reachable at
-                // the bottom. Horizontal navigation jumps there directly.
                 ui->pickerBottomSelection = 2;
             } else {
                 ui->pickerBottomSelection = std::clamp(
@@ -625,23 +976,23 @@ int gav_ui_process_controller(GAVUIOverlay *ui,
         if (snapshot->uiSelect != 0) {
             if (ui->pickerBottomSelection >= 0) {
                 switch (ui->pickerBottomSelection) {
-                    case 0: // page up
+                    case 0:
                         if (lastIndex >= 0) {
                             ui->pickerSelection = std::max(0, ui->pickerSelection - kPickerRows);
                             ui->pickerBottomSelection = -1;
                         }
                         break;
-                    case 1: // page down
+                    case 1:
                         if (lastIndex >= 0) {
                             ui->pickerSelection = std::min(lastIndex,
                                                            ui->pickerSelection + kPickerRows);
                             ui->pickerBottomSelection = -1;
                         }
                         break;
-                    case 2: // Drives
+                    case 2:
                         loadPickerDirectory(ui, "/Volumes");
                         break;
-                    case 3: // Cancel
+                    case 3:
                         ui->pickerMode = false;
                         ui->pickerBottomSelection = -1;
                         break;
@@ -667,11 +1018,11 @@ int gav_ui_process_controller(GAVUIOverlay *ui,
     }
 
     if (snapshot->uiNavX != 0) {
-        ui->controlSelection = std::clamp(ui->controlSelection + snapshot->uiNavX, 0, 2);
+        ui->controlSelection = std::clamp(ui->controlSelection + snapshot->uiNavX, 0, 3);
         ui->dirty = true;
     }
     if (snapshot->uiNavY != 0) {
-        ui->controlSelection = std::clamp(ui->controlSelection + snapshot->uiNavY, 0, 2);
+        ui->controlSelection = std::clamp(ui->controlSelection + snapshot->uiNavY, 0, 3);
         ui->dirty = true;
     }
     if (snapshot->uiSelect != 0 && action) {
@@ -680,9 +1031,12 @@ int gav_ui_process_controller(GAVUIOverlay *ui,
                 openPicker(ui);
                 break;
             case 1:
-                action->type = GAV_UI_ACTION_PLAY_PAUSE;
+                openBrowser(ui);
                 break;
             case 2:
+                action->type = GAV_UI_ACTION_PLAY_PAUSE;
+                break;
+            case 3:
                 action->type = GAV_UI_ACTION_RECENTER;
                 break;
         }
