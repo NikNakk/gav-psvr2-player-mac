@@ -82,7 +82,7 @@ function(configure_openxr_metal_target target)
     )
 endfunction()
 
-add_executable(gav-monado-poc main.mm)
+add_executable(gav-monado-poc player_projection.mm)
 configure_openxr_metal_target(gav-monado-poc)
 target_link_libraries(gav-monado-poc PRIVATE
     ${AVFOUNDATION_FRAMEWORK}
