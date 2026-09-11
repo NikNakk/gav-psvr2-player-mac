@@ -32,24 +32,27 @@ Intentionally deferred until this path is proven:
 
 The next architectural step for immersive video is an `XrCompositionLayerProjection` using `xrLocateViews`, with the existing GAV projection shaders adapted to render the decoded texture into the two OpenXR eye swapchains.
 
-## Build
+## Build on the current PSVR2 Mac setup
 
-Use the same Khronos `OpenXR-SDK-Source` checkout that you use for `hello_xr`, or an installed OpenXR CMake package.
+The working `hello_xr` build already lives under `/private/tmp/OpenXR-SDK-build`, so reuse its generated headers and loader directly:
 
 ```sh
 cmake -S openxr-poc -B openxr-poc/build \
-  -DOPENXR_SDK_SOURCE="$HOME/Code/OpenXR-SDK-Source"
+  -DOPENXR_BUILD_DIR=/private/tmp/OpenXR-SDK-build
 cmake --build openxr-poc/build -j
 ```
 
-If OpenXR is already installed as a CMake package, omit `OPENXR_SDK_SOURCE`.
+This avoids requiring a second OpenXR SDK source checkout. The POC expects generated headers under `OPENXR_BUILD_DIR/include` and the loader under `OPENXR_BUILD_DIR/src/loader`.
+
+An installed OpenXR CMake package is also supported automatically. A full `OpenXR-SDK` or `OpenXR-SDK-Source` checkout can still be supplied with `OPENXR_SDK_SOURCE`, but only if that path contains the repository's top-level `CMakeLists.txt`.
 
 ## Run
 
-Point at the **same Monado runtime JSON that already works with `hello_xr`**:
+Use the same Monado runtime and loader environment as the working `hello_xr` setup:
 
 ```sh
-XR_RUNTIME_JSON=/path/to/monado/build/openxr_monado-dev.json \
+DYLD_LIBRARY_PATH=/private/tmp/OpenXR-SDK-build/src/loader \
+XR_RUNTIME_JSON=/Users/nickkennedy/Code/monado/build-macos-psvr2-display/openxr_monado-dev.json \
   ./openxr-poc/build/gav-monado-poc /path/to/movie.mp4
 ```
 
