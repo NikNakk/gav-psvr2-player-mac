@@ -11,6 +11,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OBJCXX_STANDARD 17)
 set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 
+option(GAV_ENABLE_YTDLP "Enable URL playback through yt-dlp" OFF)
+
 set(OPENXR_BUILD_DIR "" CACHE PATH "Path to an existing Khronos OpenXR build tree")
 set(OPENXR_SDK_SOURCE "" CACHE PATH "Optional path to a Khronos OpenXR-SDK or OpenXR-SDK-Source checkout")
 
@@ -57,6 +59,8 @@ if(NOT TARGET OpenXR::openxr_loader)
         "-DOPENXR_BUILD_DIR=/private/tmp/OpenXR-SDK-build")
 endif()
 
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
 find_library(AVFOUNDATION_FRAMEWORK AVFoundation REQUIRED)
 find_library(COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
@@ -64,6 +68,7 @@ find_library(COREMEDIA_FRAMEWORK CoreMedia REQUIRED)
 find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
 find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
 find_library(METAL_FRAMEWORK Metal REQUIRED)
+find_library(GAMECONTROLLER_FRAMEWORK GameController REQUIRED)
 
 function(configure_openxr_metal_target target)
     target_compile_definitions(${target} PRIVATE
@@ -82,15 +87,44 @@ function(configure_openxr_metal_target target)
     )
 endfunction()
 
-add_executable(gav-monado-poc player_projection.mm)
+set(GAV_GENERATED_PLAYER "${CMAKE_CURRENT_BINARY_DIR}/player_projection_features.mm")
+add_custom_command(
+    OUTPUT "${GAV_GENERATED_PLAYER}"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/generate_openxr_player.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/player_projection.mm"
+            "${GAV_GENERATED_PLAYER}"
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/player_projection.mm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/generate_openxr_player.py"
+    VERBATIM
+)
+set_source_files_properties("${GAV_GENERATED_PLAYER}" PROPERTIES GENERATED TRUE)
+
+add_executable(gav-monado-poc
+    "${GAV_GENERATED_PLAYER}"
+    controller_input.mm
+    media_input.mm
+)
 configure_openxr_metal_target(gav-monado-poc)
+target_include_directories(gav-monado-poc PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(gav-monado-poc PRIVATE
+    GAV_ENABLE_YTDLP=$<BOOL:${GAV_ENABLE_YTDLP}>
+)
 target_link_libraries(gav-monado-poc PRIVATE
     ${AVFOUNDATION_FRAMEWORK}
     ${COREVIDEO_FRAMEWORK}
     ${COREMEDIA_FRAMEWORK}
     ${COREGRAPHICS_FRAMEWORK}
     ${QUARTZCORE_FRAMEWORK}
+    ${GAMECONTROLLER_FRAMEWORK}
 )
+
+if(GAV_ENABLE_YTDLP)
+    message(STATUS "GAV yt-dlp URL support: enabled (yt-dlp must be available at runtime)")
+else()
+    message(STATUS "GAV yt-dlp URL support: disabled")
+endif()
 
 add_executable(gav-monado-projection-test projection_test.mm)
 configure_openxr_metal_target(gav-monado-projection-test)
