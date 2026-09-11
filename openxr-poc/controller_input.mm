@@ -11,6 +11,11 @@ struct GAVControllerInput {
     std::atomic<int> seekSteps{0};
     std::atomic<int> volumeSteps{0};
     std::atomic<int> recenter{0};
+    std::atomic<int> uiToggle{0};
+    std::atomic<int> uiSelect{0};
+    std::atomic<int> uiBack{0};
+    std::atomic<int> uiNavX{0};
+    std::atomic<int> uiNavY{0};
     std::atomic<float> rightX{0.0f};
     std::atomic<float> rightY{0.0f};
     dispatch_queue_t eventQueue{nullptr};
@@ -21,37 +26,52 @@ struct GAVControllerInput {
 static void
 bindPress(GCControllerButtonInput *button, std::atomic<int> *counter, int delta)
 {
-    if (!button) {
-        return;
-    }
+    if (!button) return;
     button.pressedChangedHandler = ^(GCControllerButtonInput *, float, BOOL pressed) {
-        if (pressed) {
-            counter->fetch_add(delta, std::memory_order_relaxed);
-        }
+        if (pressed) counter->fetch_add(delta, std::memory_order_relaxed);
+    };
+}
+
+static void
+bindPressPair(GCControllerButtonInput *button,
+              std::atomic<int> *first,
+              int firstDelta,
+              std::atomic<int> *second,
+              int secondDelta)
+{
+    if (!button) return;
+    button.pressedChangedHandler = ^(GCControllerButtonInput *, float, BOOL pressed) {
+        if (!pressed) return;
+        if (first) first->fetch_add(firstDelta, std::memory_order_relaxed);
+        if (second) second->fetch_add(secondDelta, std::memory_order_relaxed);
     };
 }
 
 static void
 bindController(GAVControllerInput *input, GCController *controller)
 {
-    if (!input || !controller || !controller.extendedGamepad) {
-        return;
-    }
+    if (!input || !controller || !controller.extendedGamepad) return;
 
     controller.handlerQueue = input->eventQueue;
     GCExtendedGamepad *pad = controller.extendedGamepad;
 
-    // Adapted from youtube-vr-support/controller.swift. Overlay-specific
-    // actions are intentionally omitted in this CLI/OpenXR POC.
-    bindPress(pad.buttonA, &input->togglePlay, 1);
-    bindPress(pad.buttonMenu, &input->togglePlay, 1);
+    // Cross/A remains play/pause when the overlay is hidden, but is also the
+    // overlay's Select button. The main loop suppresses togglePlay while UI is active.
+    bindPressPair(pad.buttonA, &input->togglePlay, 1, &input->uiSelect, 1);
+    bindPress(pad.buttonMenu, &input->uiToggle, 1);
+    bindPress(pad.buttonB, &input->uiBack, 1);
     bindPress(pad.buttonY, &input->recenter, 1);
+
+    // Shoulders are always +/-15 s, including while the panel is visible.
     bindPress(pad.leftShoulder, &input->seekSteps, -1);
     bindPress(pad.rightShoulder, &input->seekSteps, 1);
-    bindPress(pad.dpad.left, &input->seekSteps, -1);
-    bindPress(pad.dpad.right, &input->seekSteps, 1);
-    bindPress(pad.dpad.up, &input->volumeSteps, 1);
-    bindPress(pad.dpad.down, &input->volumeSteps, -1);
+
+    // D-pad is navigation while UI is visible. The main loop maps it back to
+    // seek/volume when the UI is hidden, preserving the existing controls.
+    bindPress(pad.dpad.left, &input->uiNavX, -1);
+    bindPress(pad.dpad.right, &input->uiNavX, 1);
+    bindPress(pad.dpad.up, &input->uiNavY, -1);
+    bindPress(pad.dpad.down, &input->uiNavY, 1);
 
     pad.rightThumbstick.valueChangedHandler = ^(GCControllerDirectionPad *, float x, float y) {
         input->rightX.store(x, std::memory_order_relaxed);
@@ -73,8 +93,7 @@ gav_controller_create(void)
                                                 object:nil
                                                  queue:nil
                                             usingBlock:^(NSNotification *note) {
-        GCController *controller = (GCController *)note.object;
-        bindController(input, controller);
+        bindController(input, (GCController *)note.object);
     }];
     input->disconnectObserver = [center addObserverForName:GCControllerDidDisconnectNotification
                                                    object:nil
@@ -88,47 +107,41 @@ gav_controller_create(void)
     }];
 
     for (GCController *controller in [GCController controllers]) {
-        if (controller.extendedGamepad) {
-            bindController(input, controller);
-        }
+        if (controller.extendedGamepad) bindController(input, controller);
     }
 
-    std::printf("[controller] controls: Cross/A or Menu play/pause; L1/R1 or D-pad left/right seek 15s; "
-                "D-pad up/down volume; Triangle/Y recenter; right stick scene tilt.\n");
+    std::printf("[controller] controls: Cross/A play/pause; Menu player UI; Circle/B back; "
+                "L1/R1 seek 15s; D-pad seek/volume or UI navigation; Triangle/Y recenter; "
+                "right stick scene tilt.\n");
     return input;
 }
 
 void
 gav_controller_destroy(GAVControllerInput *input)
 {
-    if (!input) {
-        return;
-    }
+    if (!input) return;
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
-    if (input->connectObserver) {
-        [center removeObserver:input->connectObserver];
-    }
-    if (input->disconnectObserver) {
-        [center removeObserver:input->disconnectObserver];
-    }
+    if (input->connectObserver) [center removeObserver:input->connectObserver];
+    if (input->disconnectObserver) [center removeObserver:input->disconnectObserver];
     delete input;
 }
 
 void
 gav_controller_poll(GAVControllerInput *input, GAVControllerSnapshot *snapshot)
 {
-    if (!snapshot) {
-        return;
-    }
+    if (!snapshot) return;
     *snapshot = {};
-    if (!input) {
-        return;
-    }
+    if (!input) return;
 
     snapshot->togglePlay = input->togglePlay.exchange(0, std::memory_order_relaxed);
     snapshot->seekSteps = input->seekSteps.exchange(0, std::memory_order_relaxed);
     snapshot->volumeSteps = input->volumeSteps.exchange(0, std::memory_order_relaxed);
     snapshot->recenter = input->recenter.exchange(0, std::memory_order_relaxed);
+    snapshot->uiToggle = input->uiToggle.exchange(0, std::memory_order_relaxed);
+    snapshot->uiSelect = input->uiSelect.exchange(0, std::memory_order_relaxed);
+    snapshot->uiBack = input->uiBack.exchange(0, std::memory_order_relaxed);
+    snapshot->uiNavX = input->uiNavX.exchange(0, std::memory_order_relaxed);
+    snapshot->uiNavY = input->uiNavY.exchange(0, std::memory_order_relaxed);
     snapshot->rightX = input->rightX.load(std::memory_order_relaxed);
     snapshot->rightY = input->rightY.load(std::memory_order_relaxed);
 }

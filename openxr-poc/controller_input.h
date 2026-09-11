@@ -11,6 +11,11 @@ typedef struct GAVControllerSnapshot {
     int seekSteps;
     int volumeSteps;
     int recenter;
+    int uiToggle;
+    int uiSelect;
+    int uiBack;
+    int uiNavX;
+    int uiNavY;
     float rightX;
     float rightY;
 } GAVControllerSnapshot;

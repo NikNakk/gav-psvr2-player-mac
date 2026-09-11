@@ -69,6 +69,7 @@ find_library(COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
 find_library(COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
 find_library(COREMEDIA_FRAMEWORK CoreMedia REQUIRED)
 find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
+find_library(CORETEXT_FRAMEWORK CoreText REQUIRED)
 find_library(QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
 find_library(METAL_FRAMEWORK Metal REQUIRED)
 find_library(GAMECONTROLLER_FRAMEWORK GameController REQUIRED)
@@ -100,10 +101,15 @@ add_custom_command(
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/postprocess_openxr_player.py"
             "${GAV_GENERATED_PLAYER}"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/add_ui_overlay.py"
+            "${GAV_GENERATED_PLAYER}"
     DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/player_projection.mm"
         "${CMAKE_CURRENT_SOURCE_DIR}/generate_openxr_player.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/postprocess_openxr_player.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/add_ui_overlay.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ui_overlay.h"
     VERBATIM
 )
 set_source_files_properties("${GAV_GENERATED_PLAYER}" PROPERTIES GENERATED TRUE)
@@ -113,6 +119,7 @@ add_executable(gav-monado-poc
     controller_input.mm
     media_input.mm
     ambisonic_audio.mm
+    ui_overlay.mm
 )
 configure_openxr_metal_target(gav-monado-poc)
 target_include_directories(gav-monado-poc PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -127,6 +134,7 @@ target_link_libraries(gav-monado-poc PRIVATE
     ${COREVIDEO_FRAMEWORK}
     ${COREMEDIA_FRAMEWORK}
     ${COREGRAPHICS_FRAMEWORK}
+    ${CORETEXT_FRAMEWORK}
     ${QUARTZCORE_FRAMEWORK}
     ${GAMECONTROLLER_FRAMEWORK}
 )
