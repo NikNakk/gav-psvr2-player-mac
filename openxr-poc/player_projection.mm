@@ -155,6 +155,42 @@ simd_float3 rotateVector(const XrQuaternionf &q, simd_float3 v)
     return v + 2.0f * simd_cross(qv, simd_cross(qv, v) + q.w * v);
 }
 
+enum ProjectionMode {
+    ProjectionFlat = 0,
+    ProjectionVR180Equirect = 1,
+    ProjectionVR180Fisheye = 2,
+};
+
+ProjectionMode projectionModeFromEnvironment()
+{
+    const char *value = std::getenv("GAV_MONADO_PROJECTION");
+    if (!value || !*value || std::strcmp(value, "vr180") == 0 ||
+        std::strcmp(value, "equirect") == 0 || std::strcmp(value, "180") == 0) {
+        return ProjectionVR180Equirect;
+    }
+    if (std::strcmp(value, "flat") == 0) {
+        return ProjectionFlat;
+    }
+    if (std::strcmp(value, "fisheye") == 0) {
+        return ProjectionVR180Fisheye;
+    }
+    std::fprintf(stderr,
+                 "Unknown GAV_MONADO_PROJECTION='%s'; using vr180/equirect. "
+                 "Valid values: vr180, equirect, fisheye, flat.\n",
+                 value);
+    return ProjectionVR180Equirect;
+}
+
+const char *projectionModeName(ProjectionMode mode)
+{
+    switch (mode) {
+        case ProjectionFlat: return "flat virtual screen";
+        case ProjectionVR180Equirect: return "SBS VR180 half-equirectangular";
+        case ProjectionVR180Fisheye: return "SBS VR180 equidistant fisheye";
+        default: return "unknown";
+    }
+}
+
 struct EyeSwapchain {
     XrSwapchain handle{XR_NULL_HANDLE};
     uint32_t width{0};
@@ -172,13 +208,13 @@ struct ScreenAnchor {
 
 struct ScreenUniforms {
     simd_float4 viewOrientation;
-    simd_float4 viewPosition;
+    simd_float4 viewPosition; // xyz pose; w = eye index
     simd_float4 fovTangents;
     simd_float4 panelCenter;
     simd_float4 panelRight;
     simd_float4 panelUp;
     simd_float4 panelNormal;
-    simd_float4 screen; // halfWidth, halfHeight, testPattern, unused
+    simd_float4 screen; // halfWidth, halfHeight, testPattern, projectionMode
 };
 
 id<MTLRenderPipelineState> makePipeline(id<MTLDevice> device, MTLPixelFormat targetFormat)
@@ -186,6 +222,8 @@ id<MTLRenderPipelineState> makePipeline(id<MTLDevice> device, MTLPixelFormat tar
     static NSString *shaderSource = @R"METAL(
 #include <metal_stdlib>
 using namespace metal;
+
+constant float PI = 3.14159265358979323846;
 
 struct VertexOut {
     float4 position [[position]];
@@ -234,6 +272,60 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
     float3 ray = normalize(float3(rayX, rayY, -1.0));
     ray = normalize(rotateByQuaternion(ray, uni.viewOrientation));
 
+    const bool testPattern = uni.screen.z > 0.5;
+    const int projectionMode = int(round(uni.screen.w));
+    const int eye = uni.viewPosition.w > 0.5 ? 1 : 0;
+    constexpr sampler smp(coord::normalized, address::clamp_to_edge, filter::linear);
+
+    if (projectionMode == 1 || projectionMode == 2) {
+        // Express the current world-space eye ray in the orientation captured
+        // when playback first acquired a valid tracked pose. This makes the
+        // movie's centre follow the initial gaze while subsequent head motion
+        // explores the fixed VR180 hemisphere.
+        const float3 right = normalize(uni.panelRight.xyz);
+        const float3 up = normalize(uni.panelUp.xyz);
+        const float3 forward = normalize(-uni.panelNormal.xyz);
+        const float localX = dot(ray, right);
+        const float localY = dot(ray, up);
+        const float localForward = dot(ray, forward);
+
+        float2 eyeUV;
+        if (projectionMode == 1) {
+            // Half-equirectangular VR180, matching the existing GAV mode 1:
+            // longitude +/-90 degrees spans the full width of one eye image;
+            // latitude +/-90 degrees spans the full height.
+            const float lon = atan2(localX, localForward);
+            if (fabs(lon) > PI * 0.5) {
+                return float4(0.0, 0.0, 0.0, 1.0);
+            }
+            const float lat = asin(clamp(localY, -1.0, 1.0));
+            eyeUV = float2(lon / PI + 0.5,
+                           0.5 - lat / PI);
+        } else {
+            // Equidistant 180-degree fisheye, matching the existing GAV mode 2.
+            const float theta = acos(clamp(localForward, -1.0, 1.0));
+            if (theta > PI * 0.5) {
+                return float4(0.0, 0.0, 0.0, 1.0);
+            }
+            const float2 xy = float2(localX, localY);
+            const float len = length(xy);
+            const float2 d = len > 1e-6 ? xy / len : float2(0.0);
+            const float r = theta / PI;
+            eyeUV = float2(0.5 + r * d.x,
+                           0.5 - r * d.y);
+        }
+
+        if (testPattern) {
+            return float4(1.0, 0.0, 1.0, 1.0);
+        }
+
+        // SBS input: left eye occupies [0, 0.5], right eye [0.5, 1].
+        const float2 videoUV = float2(eyeUV.x * 0.5 + (eye == 1 ? 0.5 : 0.0),
+                                      eyeUV.y);
+        return video.sample(smp, videoUV);
+    }
+
+    // Flat-screen regression path retained from the known-good projection POC.
     const float3 origin = uni.viewPosition.xyz;
     const float3 center = uni.panelCenter.xyz;
     const float3 normal = uni.panelNormal.xyz;
@@ -256,13 +348,12 @@ fragment float4 videoFragment(VertexOut in [[stage_in]],
         return float4(0.0, 0.0, 0.0, 1.0);
     }
 
-    if (uni.screen.z > 0.5) {
+    if (testPattern) {
         return float4(1.0, 0.0, 1.0, 1.0);
     }
 
     const float2 videoUV = float2(0.5 + x / (2.0 * halfWidth),
                                   0.5 - y / (2.0 * halfHeight));
-    constexpr sampler smp(coord::normalized, address::clamp_to_edge, filter::linear);
     return video.sample(smp, videoUV);
 }
 )METAL";
@@ -294,9 +385,11 @@ void renderEye(id<MTLCommandQueue> queue,
                id<MTLTexture> target,
                id<MTLTexture> source,
                const XrView &view,
+               uint32_t eye,
                const ScreenAnchor &anchor,
                float panelWidth,
                float panelHeight,
+               ProjectionMode projectionMode,
                bool testPattern)
 {
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -322,7 +415,7 @@ void renderEye(id<MTLCommandQueue> queue,
             view.pose.position.x,
             view.pose.position.y,
             view.pose.position.z,
-            0.0f,
+            static_cast<float>(eye),
         };
         uni.fovTangents = {
             std::tan(view.fov.angleLeft),
@@ -334,7 +427,12 @@ void renderEye(id<MTLCommandQueue> queue,
         uni.panelRight = {anchor.right.x, anchor.right.y, anchor.right.z, 0.0f};
         uni.panelUp = {anchor.up.x, anchor.up.y, anchor.up.z, 0.0f};
         uni.panelNormal = {anchor.normal.x, anchor.normal.y, anchor.normal.z, 0.0f};
-        uni.screen = {panelWidth * 0.5f, panelHeight * 0.5f, testPattern ? 1.0f : 0.0f, 0.0f};
+        uni.screen = {
+            panelWidth * 0.5f,
+            panelHeight * 0.5f,
+            testPattern ? 1.0f : 0.0f,
+            static_cast<float>(projectionMode),
+        };
 
         [encoder setRenderPipelineState:pipeline];
         [encoder setFragmentBytes:&uni length:sizeof(uni) atIndex:0];
@@ -364,6 +462,7 @@ int main(int argc, const char *argv[])
         std::signal(SIGINT, handleSignal);
         std::signal(SIGTERM, handleSignal);
         const bool testPattern = std::getenv("GAV_MONADO_TEST_PATTERN") != nullptr;
+        const ProjectionMode projectionMode = projectionModeFromEnvironment();
 
         XrInstance instance = XR_NULL_HANDLE;
         XrSession session = XR_NULL_HANDLE;
@@ -518,11 +617,17 @@ int main(int argc, const char *argv[])
             std::printf("OpenXR system: %s\n", systemProperties.systemName);
             std::printf("Metal device: %s\n", device.name.UTF8String);
             std::printf("Video: %.0fx%.0f (aspect %.3f)\n", videoSize.width, videoSize.height, aspect);
-            std::printf("Projection mode: pose-anchored virtual screen %.2fm x %.2fm, 2.0m ahead of initial gaze\n",
-                        panelWidth, panelHeight);
-            if (testPattern) {
-                std::printf("DIAGNOSTIC: GAV_MONADO_TEST_PATTERN enabled; screen will be BRIGHT MAGENTA.\n");
+            std::printf("Projection mode: %s\n", projectionModeName(projectionMode));
+            if (projectionMode == ProjectionFlat) {
+                std::printf("Flat screen: %.2fm x %.2fm, 2.0m ahead of initial gaze\n",
+                            panelWidth, panelHeight);
+            } else {
+                std::printf("VR180 centre is anchored to initial gaze; left/right SBS halves feed the corresponding eyes.\n");
             }
+            if (testPattern) {
+                std::printf("DIAGNOSTIC: GAV_MONADO_TEST_PATTERN enabled; visible projection region will be BRIGHT MAGENTA.\n");
+            }
+            std::printf("Set GAV_MONADO_PROJECTION=flat|vr180|fisheye to select projection.\n");
             std::printf("Audio follows the current macOS default output. Ctrl-C exits.\n");
 
             bool sessionRunning = false;
@@ -613,7 +718,7 @@ int main(int argc, const char *argv[])
                     anchor.up = up;
                     anchor.normal = -forward;
                     anchor.valid = true;
-                    std::printf("DIAGNOSTIC: screen anchored at (%.3f, %.3f, %.3f), forward=(%.3f, %.3f, %.3f)\n",
+                    std::printf("DIAGNOSTIC: projection anchored; centre=(%.3f, %.3f, %.3f), forward=(%.3f, %.3f, %.3f)\n",
                                 anchor.center.x, anchor.center.y, anchor.center.z,
                                 forward.x, forward.y, forward.z);
                 }
@@ -681,9 +786,11 @@ int main(int argc, const char *argv[])
                                   target,
                                   source,
                                   views[eye],
+                                  eye,
                                   anchor,
                                   panelWidth,
                                   panelHeight,
+                                  projectionMode,
                                   testPattern);
 
                         XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
