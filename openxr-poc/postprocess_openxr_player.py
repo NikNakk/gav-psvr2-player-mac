@@ -219,9 +219,6 @@ replace_once(
     '            std::printf("Audio routes to PS VR2; cached AmbiX sidecars use head-tracked macOS HRTF. Ctrl-C exits.\\n");\n',
 )
 
-# Controller play/pause, seek and volume need to operate the sidecar together
-# with AVPlayer.  Resuming and playing seeks are rescheduled against a shared
-# host timestamp so audio/video restart together.
 replace_once(
     '''                if ((controls.togglePlay & 1) != 0 && playerItem.status == AVPlayerItemStatusReadyToPlay) {
                     if (player.rate > 0.0f) {
@@ -359,10 +356,12 @@ replace_once(
                     (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 &&
                     (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
 ''',
-    '''                const bool poseValid =
-                    (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 &&
+    '''                const bool orientationValid =
+                    (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+                const bool poseValid =
+                    orientationValid &&
                     (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
-                if (ambisonic && poseValid && locatedViewCount == viewCount) {
+                if (ambisonic && orientationValid && locatedViewCount == viewCount) {
                     gav_ambisonic_set_head_orientation(ambisonic, &views[0].pose.orientation);
                 }
 ''',

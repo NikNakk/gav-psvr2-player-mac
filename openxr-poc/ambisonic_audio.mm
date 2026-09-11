@@ -164,10 +164,6 @@ bool buildNativeCache(NSString *sidecarPath, NSString *pcmPath)
         return true;
     }
 
-    // Preserve the four AmbiX channels exactly as decoded by ffmpeg. YouTube's
-    // ambisonics_quad is ACN/SN3D: W, Y, Z, X. The explicit HOA layout is
-    // supplied to AVAudioEngine below, so the cache only needs to preserve
-    // channel order and sample values.
     NSTask *task = [[NSTask alloc] init];
     task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/env"];
     task.arguments = @[
@@ -306,9 +302,6 @@ GAVAmbisonicAudio *gav_ambisonic_create(const char *sidecarPath)
         state.player.renderingAlgorithm = AVAudio3DMixingRenderingAlgorithmAuto;
         state.player.sourceMode = AVAudio3DMixingSourceModeAmbienceBed;
         state.player.reverbBlend = 0.0f;
-        // The ambience-bed direction controls the bed's rotation in world space.
-        // Keep the direction that gives the correct static AmbiX orientation;
-        // head motion is applied through the environment listener below.
         state.player.position = AVAudioMake3DPoint(0.0f, 0.0f, -1.0f);
         state.engine.mainMixerNode.outputVolume = 1.0f;
 
@@ -328,6 +321,9 @@ GAVAmbisonicAudio *gav_ambisonic_create(const char *sidecarPath)
         auto *audio = new GAVAmbisonicAudio{};
         audio->retainedState = (__bridge_retained void *)state;
         audio->traceOrientation = std::getenv("GAV_AMBISONIC_TRACE") != nullptr;
+        if (audio->traceOrientation) {
+            std::fprintf(stderr, "[audio] GAV_AMBISONIC_TRACE enabled\n");
+        }
         std::printf("[audio] native head-tracked AmbiX enabled (ACN/SN3D -> Apple binaural renderer)\n");
         return audio;
     }
@@ -335,9 +331,7 @@ GAVAmbisonicAudio *gav_ambisonic_create(const char *sidecarPath)
 
 void gav_ambisonic_destroy(GAVAmbisonicAudio *audio)
 {
-    if (!audio) {
-        return;
-    }
+    if (!audio) return;
     @autoreleasepool {
         GAVAmbisonicState *state = stateFor(audio);
         [state.player stop];
@@ -356,9 +350,7 @@ bool gav_ambisonic_schedule(GAVAmbisonicAudio *audio,
                             uint64_t *hostTimeOut)
 {
     GAVAmbisonicState *state = stateFor(audio);
-    if (!state || !state.file || !state.player) {
-        return false;
-    }
+    if (!state || !state.file || !state.player) return false;
 
     mediaTimeSeconds = std::max(0.0, mediaTimeSeconds);
     const double sampleRate = state.file.processingFormat.sampleRate;
@@ -366,9 +358,7 @@ bool gav_ambisonic_schedule(GAVAmbisonicAudio *audio,
         static_cast<AVAudioFramePosition>(std::llround(mediaTimeSeconds * sampleRate));
 
     [state.player stop];
-    if (startFrame >= state.file.length) {
-        return false;
-    }
+    if (startFrame >= state.file.length) return false;
 
     const AVAudioFramePosition remaining = state.file.length - startFrame;
     const AVAudioFrameCount frameCount = static_cast<AVAudioFrameCount>(
@@ -396,26 +386,20 @@ bool gav_ambisonic_schedule(GAVAmbisonicAudio *audio,
     AVAudioTime *audioStart = [AVAudioTime timeWithHostTime:hostTime];
     [state.player playAtTime:audioStart];
 
-    if (hostTimeOut) {
-        *hostTimeOut = hostTime;
-    }
+    if (hostTimeOut) *hostTimeOut = hostTime;
     return true;
 }
 
 void gav_ambisonic_pause(GAVAmbisonicAudio *audio)
 {
     GAVAmbisonicState *state = stateFor(audio);
-    if (state) {
-        [state.player pause];
-    }
+    if (state) [state.player pause];
 }
 
 void gav_ambisonic_set_volume(GAVAmbisonicAudio *audio, float volume)
 {
     GAVAmbisonicState *state = stateFor(audio);
-    if (state) {
-        state.engine.mainMixerNode.outputVolume = std::clamp(volume, 0.0f, 1.0f);
-    }
+    if (state) state.engine.mainMixerNode.outputVolume = std::clamp(volume, 0.0f, 1.0f);
 }
 
 void gav_ambisonic_set_scene_basis(GAVAmbisonicAudio *audio,
@@ -423,9 +407,7 @@ void gav_ambisonic_set_scene_basis(GAVAmbisonicAudio *audio,
                                    float upX, float upY, float upZ,
                                    float forwardX, float forwardY, float forwardZ)
 {
-    if (!audio) {
-        return;
-    }
+    if (!audio) return;
 
     audio->sceneRight[0] = rightX;
     audio->sceneRight[1] = rightY;
@@ -446,8 +428,10 @@ void gav_ambisonic_set_head_orientation(GAVAmbisonicAudio *audio,
                                         const XrQuaternionf *orientation)
 {
     GAVAmbisonicState *state = stateFor(audio);
-    if (!state || !orientation) {
-        return;
+    if (!state || !orientation) return;
+
+    if (audio->traceOrientation && audio->orientationUpdateCount == 0) {
+        std::fprintf(stderr, "[audio] first OpenXR orientation callback received\n");
     }
 
     float fx, fy, fz;
@@ -457,9 +441,6 @@ void gav_ambisonic_set_head_orientation(GAVAmbisonicAudio *audio,
 
     AVAudio3DVectorOrientation requestedOrientation{};
     if (audio->sceneBasisValid) {
-        // Express the current headset orientation in the coordinate system
-        // captured at recenter/initial gaze. In that local system +X is right,
-        // +Y is up and -Z is movie-forward, matching AVAudioEnvironmentNode.
         const float localForwardX = dot3(fx, fy, fz, audio->sceneRight);
         const float localForwardY = dot3(fx, fy, fz, audio->sceneUp);
         const float localForwardZ = -dot3(fx, fy, fz, audio->sceneForward);
@@ -476,21 +457,16 @@ void gav_ambisonic_set_head_orientation(GAVAmbisonicAudio *audio,
             AVAudioMake3DVector(ux, uy, uz));
     }
 
-    // Apple documents listenerVectorOrientation and listenerAngularOrientation
-    // as linked representations of the same listener pose. Native Ambisonic
-    // examples drive the angular property, however, so explicitly commit the
-    // equivalent angular value after calculating our pose with vectors. This
-    // keeps the robust OpenXR basis conversion above while using the code path
-    // known to update ambience-bed rendering.
     state.environment.listenerVectorOrientation = requestedOrientation;
     const AVAudio3DAngularOrientation angular = state.environment.listenerAngularOrientation;
     state.environment.listenerAngularOrientation = angular;
 
     ++audio->orientationUpdateCount;
     if (audio->traceOrientation && (audio->orientationUpdateCount % 180u) == 1u) {
-        std::printf("[audio] listener pose yaw=%+.1f pitch=%+.1f roll=%+.1f deg\n",
-                    angular.yaw,
-                    angular.pitch,
-                    angular.roll);
+        std::fprintf(stderr,
+                     "[audio] listener pose yaw=%+.1f pitch=%+.1f roll=%+.1f deg\n",
+                     angular.yaw,
+                     angular.pitch,
+                     angular.roll);
     }
 }
