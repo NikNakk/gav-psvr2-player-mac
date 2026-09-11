@@ -63,6 +63,7 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
 find_library(AVFOUNDATION_FRAMEWORK AVFoundation REQUIRED)
+find_library(COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
 find_library(COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
 find_library(COREMEDIA_FRAMEWORK CoreMedia REQUIRED)
 find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
@@ -94,9 +95,13 @@ add_custom_command(
             "${CMAKE_CURRENT_SOURCE_DIR}/generate_openxr_player.py"
             "${CMAKE_CURRENT_SOURCE_DIR}/player_projection.mm"
             "${GAV_GENERATED_PLAYER}"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/postprocess_openxr_player.py"
+            "${GAV_GENERATED_PLAYER}"
     DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/player_projection.mm"
         "${CMAKE_CURRENT_SOURCE_DIR}/generate_openxr_player.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/postprocess_openxr_player.py"
     VERBATIM
 )
 set_source_files_properties("${GAV_GENERATED_PLAYER}" PROPERTIES GENERATED TRUE)
@@ -113,6 +118,7 @@ target_compile_definitions(gav-monado-poc PRIVATE
 )
 target_link_libraries(gav-monado-poc PRIVATE
     ${AVFOUNDATION_FRAMEWORK}
+    ${COREAUDIO_FRAMEWORK}
     ${COREVIDEO_FRAMEWORK}
     ${COREMEDIA_FRAMEWORK}
     ${COREGRAPHICS_FRAMEWORK}
