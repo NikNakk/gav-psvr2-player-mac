@@ -38,6 +38,58 @@ void fillRounded(CGContextRef ctx, CGRect rect, CGFloat radius,
     CGPathRelease(path);
 }
 
+struct TextLine {
+    CTFontRef font{nullptr};
+    CGColorRef color{nullptr};
+    CFStringRef string{nullptr};
+    CFAttributedStringRef attributed{nullptr};
+    CTLineRef line{nullptr};
+    CGFloat width{0.0};
+};
+
+TextLine makeTextLine(const std::string &text,
+                      CGFloat size,
+                      CGFloat r = 1.0,
+                      CGFloat g = 1.0,
+                      CGFloat b = 1.0)
+{
+    TextLine result{};
+    result.string = CFStringCreateWithCString(kCFAllocatorDefault,
+                                               text.c_str(),
+                                               kCFStringEncodingUTF8);
+    if (!result.string) return result;
+    result.font = CTFontCreateWithName(CFSTR("SF Pro Display"), size, nullptr);
+    result.color = CGColorCreateGenericRGB(r, g, b, 1.0);
+    const void *keys[] = {kCTFontAttributeName, kCTForegroundColorAttributeName};
+    const void *values[] = {result.font, result.color};
+    CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault,
+                                                keys,
+                                                values,
+                                                2,
+                                                &kCFTypeDictionaryKeyCallBacks,
+                                                &kCFTypeDictionaryValueCallBacks);
+    result.attributed = CFAttributedStringCreate(kCFAllocatorDefault,
+                                                  result.string,
+                                                  attrs);
+    CFRelease(attrs);
+    result.line = CTLineCreateWithAttributedString(result.attributed);
+    result.width = static_cast<CGFloat>(CTLineGetTypographicBounds(result.line,
+                                                                   nullptr,
+                                                                   nullptr,
+                                                                   nullptr));
+    return result;
+}
+
+void releaseTextLine(TextLine &line)
+{
+    if (line.line) CFRelease(line.line);
+    if (line.attributed) CFRelease(line.attributed);
+    if (line.color) CGColorRelease(line.color);
+    if (line.font) CFRelease(line.font);
+    if (line.string) CFRelease(line.string);
+    line = {};
+}
+
 void drawText(CGContextRef ctx,
               const std::string &text,
               CGFloat x,
@@ -48,32 +100,35 @@ void drawText(CGContextRef ctx,
               CGFloat b = 1.0)
 {
     if (text.empty()) return;
-    CFStringRef string = CFStringCreateWithCString(kCFAllocatorDefault,
-                                                    text.c_str(),
-                                                    kCFStringEncodingUTF8);
-    if (!string) return;
-    CTFontRef font = CTFontCreateWithName(CFSTR("SF Pro Display"), size, nullptr);
-    CGColorRef color = CGColorCreateGenericRGB(r, g, b, 1.0);
-    const void *keys[] = {kCTFontAttributeName, kCTForegroundColorAttributeName};
-    const void *values[] = {font, color};
-    CFDictionaryRef attrs = CFDictionaryCreate(kCFAllocatorDefault,
-                                                keys,
-                                                values,
-                                                2,
-                                                &kCFTypeDictionaryKeyCallBacks,
-                                                &kCFTypeDictionaryValueCallBacks);
-    CFAttributedStringRef attributed = CFAttributedStringCreate(kCFAllocatorDefault,
-                                                                 string,
-                                                                 attrs);
-    CTLineRef line = CTLineCreateWithAttributedString(attributed);
+    TextLine line = makeTextLine(text, size, r, g, b);
+    if (!line.line) {
+        releaseTextLine(line);
+        return;
+    }
     CGContextSetTextPosition(ctx, x, y);
-    CTLineDraw(line, ctx);
-    CFRelease(line);
-    CFRelease(attributed);
-    CFRelease(attrs);
-    CGColorRelease(color);
-    CFRelease(font);
-    CFRelease(string);
+    CTLineDraw(line.line, ctx);
+    releaseTextLine(line);
+}
+
+void drawCenteredText(CGContextRef ctx,
+                      const std::string &text,
+                      CGRect rect,
+                      CGFloat size,
+                      CGFloat r = 1.0,
+                      CGFloat g = 1.0,
+                      CGFloat b = 1.0)
+{
+    if (text.empty()) return;
+    TextLine line = makeTextLine(text, size, r, g, b);
+    if (!line.line) {
+        releaseTextLine(line);
+        return;
+    }
+    const CGFloat x = CGRectGetMidX(rect) - line.width * 0.5;
+    const CGFloat y = CGRectGetMidY(rect) - size * 0.34;
+    CGContextSetTextPosition(ctx, x, y);
+    CTLineDraw(line.line, ctx);
+    releaseTextLine(line);
 }
 
 std::string timeLabel(double seconds)
@@ -97,6 +152,16 @@ std::string basenameForPath(const std::string &path)
     if (path.empty()) return "No video";
     NSString *ns = [NSString stringWithUTF8String:path.c_str()];
     return ns.lastPathComponent.UTF8String ?: path;
+}
+
+std::string shortenedLabel(const std::string &text, NSUInteger maxCharacters)
+{
+    NSString *ns = [NSString stringWithUTF8String:text.c_str()];
+    if (!ns) return text;
+    if (ns.length <= maxCharacters) return text;
+    NSString *shortened = [[ns substringToIndex:maxCharacters > 1 ? maxCharacters - 1 : 0]
+        stringByAppendingString:@"…"];
+    return shortened.UTF8String ?: text;
 }
 
 } // namespace
@@ -207,60 +272,107 @@ static void openPicker(GAVUIOverlay *ui)
     loadPickerDirectory(ui, start.UTF8String ?: NSHomeDirectory().UTF8String);
 }
 
-static void drawControls(GAVUIOverlay *ui, CGContextRef ctx)
+static void drawTimeline(GAVUIOverlay *ui, CGContextRef ctx)
 {
-    drawText(ctx, ui->currentName, 64, 438, 31);
+    const CGRect timelineRect = CGRectMake(24, 348, 976, 88);
+    const CGRect track = CGRectMake(52, 377, 920, 12);
 
-    const CGRect track = CGRectMake(72, 278, 880, 28);
-    fillRounded(ctx, track, 14, 0.20, 0.22, 0.25);
     double fraction = 0.0;
     if (std::isfinite(ui->durationSeconds) && ui->durationSeconds > 0.01) {
         fraction = std::clamp(ui->currentSeconds / ui->durationSeconds, 0.0, 1.0);
     }
+
+    fillRounded(ctx, track, 6, 0.30, 0.32, 0.38, 1.0);
     if (fraction > 0.0) {
         fillRounded(ctx,
                     CGRectMake(track.origin.x,
                                track.origin.y,
                                track.size.width * fraction,
                                track.size.height),
-                    14,
-                    0.82, 0.84, 0.89);
+                    6,
+                    0.36, 0.42, 0.95, 1.0);
     }
-    drawText(ctx,
-             timeLabel(ui->currentSeconds) + "  /  " + timeLabel(ui->durationSeconds),
-             72, 328, 24, 0.84, 0.86, 0.90);
-    drawText(ctx, "L1 / R1  seek 15 s", 734, 328, 19, 0.65, 0.68, 0.74);
 
-    struct ButtonDef { const char *label; CGFloat x; };
-    const ButtonDef buttons[] = {
-        {"Files", 72},
-        {ui->playing ? "Pause" : "Play", 372},
-        {"Recenter", 672},
-    };
-    for (int i = 0; i < 3; ++i) {
-        const bool selected = ui->controlSelection == i;
-        fillRounded(ctx,
-                    CGRectMake(buttons[i].x, 92, 280, 112),
-                    22,
-                    selected ? 0.34 : 0.20,
-                    selected ? 0.38 : 0.22,
-                    selected ? 0.48 : 0.27);
-        drawText(ctx, buttons[i].label, buttons[i].x + 76, 132, 29,
-                 selected ? 1.0 : 0.90,
-                 selected ? 1.0 : 0.91,
-                 selected ? 1.0 : 0.94);
+    const CGFloat knobX = track.origin.x + track.size.width * fraction;
+    setFill(ctx, 1.0, 1.0, 1.0, 1.0);
+    CGContextFillEllipseInRect(ctx, CGRectMake(knobX - 14, CGRectGetMidY(track) - 14, 28, 28));
+
+    const std::string current = timeLabel(ui->currentSeconds);
+    const std::string duration = timeLabel(ui->durationSeconds);
+    drawText(ctx, current, timelineRect.origin.x + 8, 405, 22, 0.90, 0.91, 0.94);
+
+    TextLine durationLine = makeTextLine(duration, 22, 0.90, 0.91, 0.94);
+    if (durationLine.line) {
+        CGContextSetTextPosition(ctx,
+                                 CGRectGetMaxX(timelineRect) - durationLine.width - 8,
+                                 405);
+        CTLineDraw(durationLine.line, ctx);
     }
-    drawText(ctx, "D-pad: choose   Cross: select   Circle/Menu: close",
-             222, 38, 18, 0.60, 0.63, 0.69);
+    releaseTextLine(durationLine);
+}
+
+static void drawControlButton(CGContextRef ctx,
+                              CGRect rect,
+                              const std::string &label,
+                              bool selected)
+{
+    if (selected) {
+        fillRounded(ctx, rect, 14, 0.36, 0.42, 0.95, 1.0);
+    } else {
+        fillRounded(ctx, rect, 14, 0.20, 0.22, 0.27, 1.0);
+    }
+    drawCenteredText(ctx, label, rect, 32);
+}
+
+static void drawControls(GAVUIOverlay *ui, CGContextRef ctx)
+{
+    const std::string title = shortenedLabel(ui->currentName, 58);
+    drawText(ctx, title, 30, 461, 27, 0.94, 0.95, 0.97);
+    drawTimeline(ui, ctx);
+
+    const CGFloat buttonW = 232.0;
+    const CGFloat buttonH = 100.0;
+    const CGFloat gap = 16.0;
+    const CGFloat totalW = buttonW * 3.0 + gap * 2.0;
+    const CGFloat x0 = (static_cast<CGFloat>(kWidth) - totalW) * 0.5;
+    const CGFloat y = 116.0;
+
+    const struct {
+        const char *label;
+        int actionIndex;
+    } buttons[] = {
+        {"Files", 0},
+        {ui->playing ? "❚❚ Pause" : "▶ Play", 1},
+        {"Recenter", 2},
+    };
+
+    for (int i = 0; i < 3; ++i) {
+        drawControlButton(ctx,
+                          CGRectMake(x0 + i * (buttonW + gap), y, buttonW, buttonH),
+                          buttons[i].label,
+                          ui->controlSelection == buttons[i].actionIndex);
+    }
+
+    drawCenteredText(ctx,
+                     "D-pad: choose    Cross: select    L1/R1: seek 15 s    Circle/Menu: close",
+                     CGRectMake(20, 28, kWidth - 40, 48),
+                     18,
+                     0.67, 0.69, 0.75);
 }
 
 static void drawPicker(GAVUIOverlay *ui, CGContextRef ctx)
 {
     std::string folder = basenameForPath(ui->pickerDir);
     if (folder.empty()) folder = ui->pickerDir;
-    drawText(ctx, "Files — " + folder, 54, 447, 30);
+    folder = shortenedLabel(folder, 48);
+    drawText(ctx, "Files — " + folder, 28, 458, 28, 0.94, 0.95, 0.97);
 
-    constexpr int rows = 7;
+    constexpr int rows = 6;
+    constexpr CGFloat rowH = 54.0;
+    constexpr CGFloat gap = 8.0;
+    constexpr CGFloat x0 = 24.0;
+    constexpr CGFloat width = 976.0;
+
     if (ui->pickerSelection < ui->pickerOffset) ui->pickerOffset = ui->pickerSelection;
     if (ui->pickerSelection >= ui->pickerOffset + rows) {
         ui->pickerOffset = ui->pickerSelection - rows + 1;
@@ -270,27 +382,42 @@ static void drawPicker(GAVUIOverlay *ui, CGContextRef ctx)
         const int index = ui->pickerOffset + row;
         if (index >= static_cast<int>(ui->pickerEntries.size())) break;
         const PickerEntry &entry = ui->pickerEntries[index];
-        const CGFloat y = 382 - row * 52;
-        if (index == ui->pickerSelection) {
-            fillRounded(ctx, CGRectMake(42, y - 10, 940, 46), 12,
-                        0.34, 0.38, 0.48);
+        const CGFloat yTop = 76.0 + row * (rowH + gap);
+        const CGFloat y = static_cast<CGFloat>(kHeight) - yTop - rowH;
+        const CGRect rect = CGRectMake(x0, y, width, rowH);
+        const bool selected = index == ui->pickerSelection;
+
+        if (selected) {
+            fillRounded(ctx, rect, 14, 0.36, 0.42, 0.95, 1.0);
+        } else {
+            fillRounded(ctx, rect, 14, 0.20, 0.22, 0.27, 1.0);
         }
-        std::string label = entry.directory && entry.name != ".."
-            ? "▸  " + entry.name
-            : entry.name;
-        if (label.size() > 78) label = label.substr(0, 75) + "…";
-        drawText(ctx, label, 62, y, 23,
-                 index == ui->pickerSelection ? 1.0 : 0.88,
-                 index == ui->pickerSelection ? 1.0 : 0.89,
-                 index == ui->pickerSelection ? 1.0 : 0.92);
+
+        std::string icon;
+        if (entry.directory) {
+            icon = entry.name == ".." ? "‹  " : "▸  ";
+        } else if (entry.path == ui->currentPath) {
+            icon = "▶  ";
+        } else {
+            icon = "●  ";
+        }
+        const std::string label = icon + shortenedLabel(entry.name, 62);
+        drawText(ctx, label, rect.origin.x + 20, rect.origin.y + 15, 26);
     }
 
     if (ui->pickerEntries.empty()) {
-        drawText(ctx, "No supported videos in this folder", 250, 244, 24,
-                 0.75, 0.77, 0.82);
+        drawCenteredText(ctx,
+                         "No supported videos in this folder",
+                         CGRectMake(100, 190, 824, 100),
+                         24,
+                         0.76, 0.78, 0.83);
     }
-    drawText(ctx, "D-pad ↑/↓: choose   Cross: open   Circle: player",
-             246, 30, 18, 0.60, 0.63, 0.69);
+
+    drawCenteredText(ctx,
+                     "D-pad ↑/↓: choose    Cross: open    Circle: player",
+                     CGRectMake(20, 10, kWidth - 40, 48),
+                     18,
+                     0.67, 0.69, 0.75);
 }
 
 static void redraw(GAVUIOverlay *ui)
@@ -313,10 +440,13 @@ static void redraw(GAVUIOverlay *ui)
     if (!ctx) return;
 
     CGContextClearRect(ctx, CGRectMake(0, 0, kWidth, kHeight));
-    fillRounded(ctx, CGRectMake(12, 12, kWidth - 24, kHeight - 24), 34,
-                0.065, 0.073, 0.090, 1.0);
-    fillRounded(ctx, CGRectMake(24, 24, kWidth - 48, kHeight - 48), 28,
-                0.10, 0.11, 0.14, 1.0);
+
+    // Match the original GAV overlay: one restrained charcoal plate rather
+    // than the nested-card treatment used by the first OpenXR placeholder.
+    fillRounded(ctx,
+                CGRectMake(4, 4, kWidth - 8, kHeight - 8),
+                28,
+                0.07, 0.08, 0.10, 1.0);
 
     if (ui->pickerMode) drawPicker(ui, ctx);
     else drawControls(ui, ctx);
