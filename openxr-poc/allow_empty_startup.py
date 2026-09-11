@@ -22,8 +22,8 @@ def replace_once(needle: str, replacement: str) -> None:
     source = source.replace(needle, replacement, 1)
 
 
-# With an in-headset picker there is no reason to require an initial media
-# argument. Keep one optional path/URL for the existing direct-launch workflow.
+# With an in-headset browser/picker there is no reason to require an initial
+# media argument. Keep one optional path/URL for the direct-launch workflow.
 replace_once(
     '''        if (argc != 2) {
             std::fprintf(stderr, "usage: %s /path/to/video-or-url\\n", argv[0]);
@@ -37,8 +37,6 @@ replace_once(
 ''',
 )
 
-# Make the initial media resolution optional. Runtime file selection already
-# replaces AVPlayerItem/AVPlayerItemVideoOutput without touching OpenXR.
 replace_once(
     '''            const GAVResolvedMediaInput resolvedInput = gav_resolve_media_input(argv[1]);
             projectionMode = projectionModeFromEnvironment(resolvedInput.path, resolvedInput.youtubeEAC);
@@ -98,7 +96,6 @@ replace_once(
 ''',
 )
 
-# Avoid asking a nil AVPlayerItem for a structure-valued duration.
 replace_once(
     '''                double uiDuration = CMTimeGetSeconds(playerItem.duration);
 ''',
@@ -106,9 +103,9 @@ replace_once(
 ''',
 )
 
-# The UI helper already contains all picker navigation. Drive its public
-# controller interface once at startup to open Files automatically when no
-# media argument was supplied: Menu -> select Files -> Cross.
+# No-argument startup now deliberately opens YouTube. UIOverlay's default
+# selection is the YouTube tile, so Menu -> Cross is sufficient and avoids
+# relying on a historical button index shift.
 replace_once(
     '''            uiOverlay = gav_ui_create(device, currentMediaPath.c_str());
 
@@ -121,12 +118,9 @@ replace_once(
                 startupControls.uiToggle = 1;
                 gav_ui_process_controller(uiOverlay, &startupControls, &startupAction);
                 startupControls = {};
-                startupControls.uiNavX = -1;
-                gav_ui_process_controller(uiOverlay, &startupControls, &startupAction);
-                startupControls = {};
                 startupControls.uiSelect = 1;
                 gav_ui_process_controller(uiOverlay, &startupControls, &startupAction);
-                std::printf("[ui] no startup media; file picker opened\\n");
+                std::printf("[ui] no startup media; YouTube browser opened\\n");
             }
 
             auto openMedia = [&](const char *input) -> bool {

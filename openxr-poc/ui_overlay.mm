@@ -209,7 +209,7 @@ struct GAVUIOverlay {
     bool visible{false};
     bool pickerMode{false};
     bool browserMode{false};
-    int controlSelection{2}; // Files, YouTube, Play/Pause, Recenter
+    int controlSelection{1}; // Files, YouTube, Play/Pause, Recenter
     std::string pickerDir;
     std::vector<PickerEntry> pickerEntries;
     int pickerSelection{0};
@@ -226,6 +226,7 @@ struct GAVUIOverlay {
     bool browserNeedsSnapshot{false};
     double lastBrowserSnapshot{0.0};
     double lastBrowserScroll{0.0};
+    double lastBrowserCursorUpdate{0.0};
     double browserCursorU{0.50};
     double browserCursorV{0.50};
     std::string pendingBrowserURL;
@@ -246,7 +247,7 @@ static void browserLaunchRequested(GAVUIOverlay *ui, NSString *url)
 {
     if (!ui || !url.length) return;
     ui->pendingBrowserURL = url.UTF8String ?: "";
-    std::printf("[youtube-ui] Play in PSVR2 requested: %s\n",
+    std::printf("[youtube-ui] VR launch requested: %s\n",
                 ui->pendingBrowserURL.c_str());
 }
 
@@ -283,6 +284,32 @@ static NSString *browserInjectionScript()
     return @R"JS(
 (() => {
   const BUTTON_ID = 'gav-psvr2-play-button';
+  const isPlayableURL = value => {
+    try {
+      const u = new URL(value, location.href);
+      const host = u.hostname.toLowerCase();
+      const isYouTube = host === 'youtube.com' || host === 'www.youtube.com' || host.endsWith('.youtube.com');
+      if (!isYouTube) return null;
+      if (u.pathname === '/watch' && u.searchParams.get('v')) return u.href;
+      if (u.pathname.startsWith('/shorts/')) return u.href;
+    } catch (_) {}
+    return null;
+  };
+
+  // Clicking a real video result should enter VR immediately rather than first
+  // loading YouTube's watch page. Search/channel/playlist navigation remains
+  // normal browser navigation. The injected button below remains as fallback.
+  document.addEventListener('click', ev => {
+    const target = ev.target instanceof Element ? ev.target : null;
+    const anchor = target ? target.closest('a[href]') : null;
+    if (!anchor) return;
+    const playable = isPlayableURL(anchor.href);
+    if (!playable) return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    window.webkit.messageHandlers.gavVR.postMessage(playable);
+  }, true);
+
   const install = () => {
     document.querySelectorAll('video').forEach(v => { v.muted = true; v.pause(); });
     const onVideo = location.pathname === '/watch' || location.pathname.startsWith('/shorts/');
@@ -345,8 +372,6 @@ static void ensureBrowser(GAVUIOverlay *ui)
     ui->browser.navigationDelegate = ui->browserBridge;
     ui->browser.allowsMagnification = NO;
 
-    // WebKit is hosted in a real off-screen window so it continues to render
-    // and can accept keyboard focus for YouTube's search field when requested.
     ui->browserWindow = [[NSWindow alloc]
         initWithContentRect:NSMakeRect(-20000, -20000, kWidth, kHeight)
         styleMask:NSWindowStyleMaskTitled
@@ -369,6 +394,7 @@ static void openBrowser(GAVUIOverlay *ui)
     ui->browserMode = true;
     ui->browserCursorU = 0.50;
     ui->browserCursorV = 0.50;
+    ui->lastBrowserCursorUpdate = CACurrentMediaTime();
     ui->browserNeedsSnapshot = true;
     ui->dirty = true;
 
@@ -383,8 +409,6 @@ static void openBrowser(GAVUIOverlay *ui)
 
 static void pumpBrowserRunLoop()
 {
-    // The OpenXR player owns the main thread rather than NSApplication.run(),
-    // so give WebKit/AppKit a non-blocking chance to process callbacks/events.
     @autoreleasepool {
         for (int i = 0; i < 4; ++i) {
             NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -730,12 +754,10 @@ static void drawBrowser(GAVUIOverlay *ui, CGContextRef ctx)
                          CGRectMake(150, 206, 724, 100), 32);
     }
 
-    // A small GAV-style glass hint plate, plus a crisp native cursor rendered
-    // after the WebKit snapshot so controller targeting stays easy to see.
     const CGRect hint = CGRectMake(18, 462, kWidth - 36, 38);
     fillRounded(ctx, hint, 12, 0.07, 0.08, 0.10, 0.82);
     drawCenteredText(ctx,
-                     "D-pad: cursor   Cross: click   Right stick: scroll   Circle: back   Menu: close",
+                     "Left stick/D-pad: cursor   Cross: launch/click   Right stick: scroll   Circle: back",
                      hint, 15, 0.92, 0.93, 0.96);
 
     const CGFloat cursorX = static_cast<CGFloat>(ui->browserCursorU * kWidth);
@@ -906,6 +928,32 @@ int gav_ui_process_controller(GAVUIOverlay *ui,
     if (ui->browserMode) {
         browserScroll(ui, snapshot->rightY);
 
+        // True analog cursor movement. A radial dead zone suppresses stick
+        // noise; the nonlinear response gives fine control near centre and
+        // reaches roughly 0.8 panel-widths/second at full deflection.
+        const double now = CACurrentMediaTime();
+        const double dt = std::clamp(now - ui->lastBrowserCursorUpdate, 0.0, 0.05);
+        ui->lastBrowserCursorUpdate = now;
+        const float lx = snapshot->leftX;
+        const float ly = snapshot->leftY;
+        const float magnitude = std::sqrt(lx * lx + ly * ly);
+        constexpr float deadzone = 0.16f;
+        if (magnitude > deadzone && dt > 0.0) {
+            const float clampedMagnitude = std::min(magnitude, 1.0f);
+            const float response = (clampedMagnitude - deadzone) / (1.0f - deadzone);
+            const float curved = std::pow(response, 1.45f);
+            const double speed = 0.80 * curved;
+            const double nx = static_cast<double>(lx / magnitude);
+            const double ny = static_cast<double>(ly / magnitude);
+            ui->browserCursorU = std::clamp(ui->browserCursorU + nx * speed * dt,
+                                            0.025, 0.975);
+            // GameController +Y is up; browser V grows downwards.
+            ui->browserCursorV = std::clamp(ui->browserCursorV - ny * speed * dt,
+                                            0.04, 0.96);
+            ui->dirty = true;
+        }
+
+        // D-pad remains a useful coarse positioning option.
         if (snapshot->uiNavX != 0 || snapshot->uiNavY != 0) {
             ui->browserCursorU = std::clamp(
                 ui->browserCursorU + 0.075 * snapshot->uiNavX, 0.025, 0.975);
