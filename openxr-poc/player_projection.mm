@@ -597,9 +597,12 @@ int main(int argc, const char *argv[])
                     (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
                 if (!anchor.valid && poseValid && locatedViewCount == viewCount) {
                     const XrQuaternionf q = views[0].pose.orientation;
-                    const simd_float3 forward = simd_normalize(rotateVector(q, {0.0f, 0.0f, -1.0f}));
-                    const simd_float3 right = simd_normalize(rotateVector(q, {1.0f, 0.0f, 0.0f}));
-                    const simd_float3 up = simd_normalize(rotateVector(q, {0.0f, 1.0f, 0.0f}));
+                    const simd_float3 forward = simd_normalize(
+                        rotateVector(q, simd_make_float3(0.0f, 0.0f, -1.0f)));
+                    const simd_float3 right = simd_normalize(
+                        rotateVector(q, simd_make_float3(1.0f, 0.0f, 0.0f)));
+                    const simd_float3 up = simd_normalize(
+                        rotateVector(q, simd_make_float3(0.0f, 1.0f, 0.0f)));
                     const simd_float3 eyeCenter = {
                         0.5f * (views[0].pose.position.x + views[1].pose.position.x),
                         0.5f * (views[0].pose.position.y + views[1].pose.position.y),
