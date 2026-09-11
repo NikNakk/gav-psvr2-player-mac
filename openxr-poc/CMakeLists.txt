@@ -94,3 +94,6 @@ target_link_libraries(gav-monado-poc PRIVATE
 
 add_executable(gav-monado-projection-test projection_test.mm)
 configure_openxr_metal_target(gav-monado-projection-test)
+
+add_executable(gav-monado-quad-test quad_test.mm)
+configure_openxr_metal_target(gav-monado-quad-test)
