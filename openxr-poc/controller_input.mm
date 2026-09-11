@@ -16,6 +16,8 @@ struct GAVControllerInput {
     std::atomic<int> uiBack{0};
     std::atomic<int> uiNavX{0};
     std::atomic<int> uiNavY{0};
+    std::atomic<float> leftX{0.0f};
+    std::atomic<float> leftY{0.0f};
     std::atomic<float> rightX{0.0f};
     std::atomic<float> rightY{0.0f};
     dispatch_queue_t eventQueue{nullptr};
@@ -55,24 +57,23 @@ bindController(GAVControllerInput *input, GCController *controller)
     controller.handlerQueue = input->eventQueue;
     GCExtendedGamepad *pad = controller.extendedGamepad;
 
-    // Cross/A remains play/pause when the overlay is hidden, but is also the
-    // overlay's Select button. The main loop suppresses togglePlay while UI is active.
     bindPressPair(pad.buttonA, &input->togglePlay, 1, &input->uiSelect, 1);
     bindPress(pad.buttonMenu, &input->uiToggle, 1);
     bindPress(pad.buttonB, &input->uiBack, 1);
     bindPress(pad.buttonY, &input->recenter, 1);
 
-    // Shoulders are always +/-15 s, including while the panel is visible.
     bindPress(pad.leftShoulder, &input->seekSteps, -1);
     bindPress(pad.rightShoulder, &input->seekSteps, 1);
 
-    // D-pad is navigation while UI is visible. The main loop maps it back to
-    // seek/volume when the UI is hidden, preserving the existing controls.
     bindPress(pad.dpad.left, &input->uiNavX, -1);
     bindPress(pad.dpad.right, &input->uiNavX, 1);
     bindPress(pad.dpad.up, &input->uiNavY, -1);
     bindPress(pad.dpad.down, &input->uiNavY, 1);
 
+    pad.leftThumbstick.valueChangedHandler = ^(GCControllerDirectionPad *, float x, float y) {
+        input->leftX.store(x, std::memory_order_relaxed);
+        input->leftY.store(y, std::memory_order_relaxed);
+    };
     pad.rightThumbstick.valueChangedHandler = ^(GCControllerDirectionPad *, float x, float y) {
         input->rightX.store(x, std::memory_order_relaxed);
         input->rightY.store(y, std::memory_order_relaxed);
@@ -88,6 +89,9 @@ gav_controller_create(void)
     GAVControllerInput *input = new GAVControllerInput();
     input->eventQueue = dispatch_queue_create("local.gav.monado.controller-input", DISPATCH_QUEUE_SERIAL);
 
+    GCController.shouldMonitorBackgroundEvents = YES;
+    std::printf("[controller] background event monitoring enabled\n");
+
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     input->connectObserver = [center addObserverForName:GCControllerDidConnectNotification
                                                 object:nil
@@ -102,6 +106,8 @@ gav_controller_create(void)
         GCController *controller = (GCController *)note.object;
         NSString *name = controller.vendorName ?: controller.productCategory ?: @"controller";
         std::printf("[controller] disconnected: %s\n", name.UTF8String);
+        input->leftX.store(0.0f, std::memory_order_relaxed);
+        input->leftY.store(0.0f, std::memory_order_relaxed);
         input->rightX.store(0.0f, std::memory_order_relaxed);
         input->rightY.store(0.0f, std::memory_order_relaxed);
     }];
@@ -112,7 +118,7 @@ gav_controller_create(void)
 
     std::printf("[controller] controls: Cross/A play/pause; Menu player UI; Circle/B back; "
                 "L1/R1 seek 15s; D-pad seek/volume or UI navigation; Triangle/Y recenter; "
-                "right stick scene tilt.\n");
+                "left stick browser cursor; right stick scene tilt/browser scroll.\n");
     return input;
 }
 
@@ -142,6 +148,8 @@ gav_controller_poll(GAVControllerInput *input, GAVControllerSnapshot *snapshot)
     snapshot->uiBack = input->uiBack.exchange(0, std::memory_order_relaxed);
     snapshot->uiNavX = input->uiNavX.exchange(0, std::memory_order_relaxed);
     snapshot->uiNavY = input->uiNavY.exchange(0, std::memory_order_relaxed);
+    snapshot->leftX = input->leftX.load(std::memory_order_relaxed);
+    snapshot->leftY = input->leftY.load(std::memory_order_relaxed);
     snapshot->rightX = input->rightX.load(std::memory_order_relaxed);
     snapshot->rightY = input->rightY.load(std::memory_order_relaxed);
 }

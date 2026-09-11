@@ -16,6 +16,8 @@ typedef struct GAVControllerSnapshot {
     int uiBack;
     int uiNavX;
     int uiNavY;
+    float leftX;
+    float leftY;
     float rightX;
     float rightY;
 } GAVControllerSnapshot;
