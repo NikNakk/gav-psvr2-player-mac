@@ -24,10 +24,10 @@ def replace_once(needle: str, replacement: str) -> None:
 
 # The first UI pass drew the same NDC rectangle independently in each eye.
 # That is not stereo-correct with asymmetric OpenXR eye frusta and can be
-# impossible to fuse.  Give the UI its own world-space plane instead.
+# impossible to fuse. Give the UI its own world-space plane instead.
 replace_once(
     '    simd_float4 ui;     // visible, NDC half-width, NDC half-height, unused\n',
-    '    simd_float4 ui;     // visible, halfWidth metres, halfHeight metres, unused\n'
+    '    simd_float4 ui;     // visible, halfWidth metres, halfHeight metres, hasVideo\n'
     '    simd_float4 uiCenter;\n'
     '    simd_float4 uiRight;\n'
     '    simd_float4 uiUp;\n'
@@ -42,6 +42,29 @@ replace_once(
     '    float4 uiUp;\n'
     '    float4 uiNormal;\n'
     '};\n\nvertex VertexOut videoVertex',
+)
+
+# The UI bitmap is CoreGraphics premultiplied-alpha BGRA. Composite it over
+# the already-computed video colour in shader space; this restores the original
+# GAV panel's glass-like transparency without adding extra video texture taps.
+replace_once(
+    '''fragment float4 videoFragment(VertexOut in [[stage_in]],
+                              constant ScreenUniforms &uni [[buffer(0)]],
+                              texture2d<float> video [[texture(0)]],
+                              texture2d<float> uiTexture [[texture(1)]])
+{''',
+    '''static float4 gavCompositeUI(float4 base, float4 uiPixel, bool uiHit)
+{
+    if (!uiHit) return base;
+    const float a = clamp(uiPixel.a, 0.0, 1.0);
+    return float4(uiPixel.rgb + base.rgb * (1.0 - a), 1.0);
+}
+
+fragment float4 videoFragment(VertexOut in [[stage_in]],
+                              constant ScreenUniforms &uni [[buffer(0)]],
+                              texture2d<float> video [[texture(0)]],
+                              texture2d<float> uiTexture [[texture(1)]])
+{''',
 )
 
 replace_once(
@@ -59,8 +82,10 @@ replace_once(
     }
 ''',
     '''    // Stereo-correct UI: both eyes look at the same world-space panel.
-    // Each eye ray intersects the plane using its own tracked eye origin, so
-    // binocular disparity corresponds to a real panel ~1.5 m from the viewer.
+    // Capture its premultiplied-alpha pixel now, then composite it over the
+    // normal video result below instead of replacing the video outright.
+    bool uiHit = false;
+    float4 uiPixel = float4(0.0);
     if (uni.ui.x > 0.5) {
         const float3 uiOrigin = uni.viewPosition.xyz;
         const float3 uiCenter = uni.uiCenter.xyz;
@@ -77,11 +102,13 @@ replace_once(
                 if (fabs(uiX) <= halfW && fabs(uiY) <= halfH) {
                     const float2 uiUV = float2(0.5 + uiX / (2.0 * halfW),
                                                0.5 - uiY / (2.0 * halfH));
-                    return float4(uiTexture.sample(smp, uiUV).rgb, 1.0);
+                    uiPixel = uiTexture.sample(smp, uiUV);
+                    uiHit = uiPixel.a > 0.001;
                 }
             }
         }
     }
+    const bool hasVideo = uni.ui.w > 0.5;
 ''',
 )
 
@@ -112,7 +139,7 @@ replace_once(
             (uiVisible && uiAnchor.valid) ? 1.0f : 0.0f,
             0.60f,
             0.30f,
-            0.0f,
+            source ? 1.0f : 0.0f,
         };
         uni.uiCenter = {uiAnchor.center.x, uiAnchor.center.y, uiAnchor.center.z, 0.0f};
         uni.uiRight = {uiAnchor.right.x, uiAnchor.right.y, uiAnchor.right.z, 0.0f};
@@ -191,4 +218,45 @@ replace_once(
                                   views[eye],''',
 )
 
+# Rewrite only the Metal shader's final colour returns so the sampled UI can
+# be composited over every projection mode (including EAC) and over black when
+# no media is loaded. Keep the rest of the Objective-C++ source untouched.
+shader_start = source.find('static NSString *shaderSource = @R"METAL(')
+shader_end = source.find(')METAL";', shader_start)
+if shader_start < 0 or shader_end < 0:
+    fail("could not locate Metal shader for alpha compositing")
+shader = source[shader_start:shader_end]
+
+shader = shader.replace(
+    'return float4(0.0, 0.0, 0.0, 1.0);',
+    'return gavCompositeUI(float4(0.0, 0.0, 0.0, 1.0), uiPixel, uiHit);',
+)
+shader = shader.replace(
+    'return float4(1.0, 0.0, 1.0, 1.0);',
+    'return gavCompositeUI(float4(1.0, 0.0, 1.0, 1.0), uiPixel, uiHit);',
+)
+shader = shader.replace(
+    'return video.sample(smp, projectEAC(gavDirection, video.get_width(), video.get_height()));',
+    '''if (hasVideo) {
+                return gavCompositeUI(video.sample(smp,
+                                                   projectEAC(gavDirection,
+                                                              video.get_width(),
+                                                              video.get_height())),
+                                      uiPixel,
+                                      uiHit);
+            }
+            return gavCompositeUI(float4(0.0, 0.0, 0.0, 1.0), uiPixel, uiHit);''',
+)
+shader = shader.replace(
+    'return video.sample(smp, videoUV);',
+    '''if (hasVideo) {
+            return gavCompositeUI(video.sample(smp, videoUV), uiPixel, uiHit);
+        }
+        return gavCompositeUI(float4(0.0, 0.0, 0.0, 1.0), uiPixel, uiHit);''',
+)
+
+if 'return video.sample(' in shader:
+    fail("unhandled direct video return remains after UI compositing rewrite")
+
+source = source[:shader_start] + shader + source[shader_end:]
 path.write_text(source)
