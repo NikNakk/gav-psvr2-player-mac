@@ -104,11 +104,15 @@ add_custom_command(
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/add_ui_overlay.py"
             "${GAV_GENERATED_PLAYER}"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/allow_empty_startup.py"
+            "${GAV_GENERATED_PLAYER}"
     DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/player_projection.mm"
         "${CMAKE_CURRENT_SOURCE_DIR}/generate_openxr_player.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/postprocess_openxr_player.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/add_ui_overlay.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/allow_empty_startup.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/ui_overlay.h"
     VERBATIM
 )
