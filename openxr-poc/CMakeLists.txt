@@ -118,6 +118,9 @@ add_custom_command(
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/add_left_stick_ui_navigation.py"
             "${GAV_GENERATED_PLAYER}"
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/async_media_open.py"
+            "${GAV_GENERATED_PLAYER}"
     DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/player_projection.mm"
         "${CMAKE_CURRENT_SOURCE_DIR}/generate_openxr_player.py"
@@ -127,7 +130,9 @@ add_custom_command(
         "${CMAKE_CURRENT_SOURCE_DIR}/fix_ui_stereo.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/recenter_ui_panel.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/add_left_stick_ui_navigation.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/async_media_open.py"
         "${CMAKE_CURRENT_SOURCE_DIR}/ui_overlay.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/busy_overlay.h"
     VERBATIM
 )
 set_source_files_properties("${GAV_GENERATED_PLAYER}" PROPERTIES GENERATED TRUE)
@@ -138,6 +143,7 @@ add_executable(gav-monado-poc
     media_input.mm
     ambisonic_audio.mm
     ui_overlay.mm
+    busy_overlay.mm
 )
 configure_openxr_metal_target(gav-monado-poc)
 target_include_directories(gav-monado-poc PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

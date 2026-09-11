@@ -103,9 +103,9 @@ replace_once(
 ''',
 )
 
-# No-argument startup now deliberately opens YouTube. UIOverlay's default
-# selection is the YouTube tile, so Menu -> Cross is sufficient and avoids
-# relying on a historical button index shift.
+# No-argument startup deliberately opens Files. The UI's normal default focus is
+# YouTube, so step left once before selecting to make the startup behavior
+# explicit and independent of the historical button reordering.
 replace_once(
     '''            uiOverlay = gav_ui_create(device, currentMediaPath.c_str());
 
@@ -118,9 +118,12 @@ replace_once(
                 startupControls.uiToggle = 1;
                 gav_ui_process_controller(uiOverlay, &startupControls, &startupAction);
                 startupControls = {};
+                startupControls.uiNavX = -1;
+                gav_ui_process_controller(uiOverlay, &startupControls, &startupAction);
+                startupControls = {};
                 startupControls.uiSelect = 1;
                 gav_ui_process_controller(uiOverlay, &startupControls, &startupAction);
-                std::printf("[ui] no startup media; YouTube browser opened\\n");
+                std::printf("[ui] no startup media; file picker opened\\n");
             }
 
             auto openMedia = [&](const char *input) -> bool {
