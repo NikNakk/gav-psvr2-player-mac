@@ -11,24 +11,50 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OBJCXX_STANDARD 17)
 set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 
-set(OPENXR_SDK_SOURCE "" CACHE PATH "Path to a Khronos OpenXR-SDK-Source checkout")
-if(NOT OPENXR_SDK_SOURCE AND DEFINED ENV{OPENXR_SDK_SOURCE})
-    set(OPENXR_SDK_SOURCE "$ENV{OPENXR_SDK_SOURCE}")
-endif()
+set(OPENXR_BUILD_DIR "" CACHE PATH "Path to an existing Khronos OpenXR build tree")
+set(OPENXR_SDK_SOURCE "" CACHE PATH "Optional path to a Khronos OpenXR-SDK or OpenXR-SDK-Source checkout")
 
 find_package(OpenXR CONFIG QUIET)
 
-if(NOT TARGET OpenXR::openxr_loader)
-    if(NOT OPENXR_SDK_SOURCE)
+if(NOT TARGET OpenXR::openxr_loader AND OPENXR_BUILD_DIR)
+    find_path(OPENXR_INCLUDE_DIR
+        NAMES openxr/openxr.h
+        PATHS "${OPENXR_BUILD_DIR}/include"
+        NO_DEFAULT_PATH
+    )
+    find_library(OPENXR_LOADER_LIBRARY
+        NAMES openxr_loader
+        PATHS "${OPENXR_BUILD_DIR}/src/loader"
+        NO_DEFAULT_PATH
+    )
+
+    if(OPENXR_INCLUDE_DIR AND OPENXR_LOADER_LIBRARY)
+        add_library(OpenXR::openxr_loader SHARED IMPORTED)
+        set_target_properties(OpenXR::openxr_loader PROPERTIES
+            IMPORTED_LOCATION "${OPENXR_LOADER_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${OPENXR_INCLUDE_DIR}"
+        )
+        message(STATUS "Using existing OpenXR build: ${OPENXR_BUILD_DIR}")
+    endif()
+endif()
+
+if(NOT TARGET OpenXR::openxr_loader AND OPENXR_SDK_SOURCE)
+    if(NOT EXISTS "${OPENXR_SDK_SOURCE}/CMakeLists.txt")
         message(FATAL_ERROR
-            "OpenXR loader not found. Re-run CMake with "
-            "-DOPENXR_SDK_SOURCE=/path/to/OpenXR-SDK-Source")
+            "OPENXR_SDK_SOURCE='${OPENXR_SDK_SOURCE}' has no top-level CMakeLists.txt. "
+            "For the already-working hello_xr build, use -DOPENXR_BUILD_DIR=/private/tmp/OpenXR-SDK-build instead.")
     endif()
 
     set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
     set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
     add_subdirectory("${OPENXR_SDK_SOURCE}" "${CMAKE_BINARY_DIR}/openxr-sdk" EXCLUDE_FROM_ALL)
+endif()
+
+if(NOT TARGET OpenXR::openxr_loader)
+    message(FATAL_ERROR
+        "OpenXR loader not found. For this Mac setup use "
+        "-DOPENXR_BUILD_DIR=/private/tmp/OpenXR-SDK-build")
 endif()
 
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
