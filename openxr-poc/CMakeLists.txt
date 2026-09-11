@@ -63,6 +63,8 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
 find_library(AVFOUNDATION_FRAMEWORK AVFoundation REQUIRED)
+find_library(AVFAUDIO_FRAMEWORK AVFAudio REQUIRED)
+find_library(AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
 find_library(COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
 find_library(COREVIDEO_FRAMEWORK CoreVideo REQUIRED)
 find_library(COREMEDIA_FRAMEWORK CoreMedia REQUIRED)
@@ -110,6 +112,7 @@ add_executable(gav-monado-poc
     "${GAV_GENERATED_PLAYER}"
     controller_input.mm
     media_input.mm
+    ambisonic_audio.mm
 )
 configure_openxr_metal_target(gav-monado-poc)
 target_include_directories(gav-monado-poc PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -118,6 +121,8 @@ target_compile_definitions(gav-monado-poc PRIVATE
 )
 target_link_libraries(gav-monado-poc PRIVATE
     ${AVFOUNDATION_FRAMEWORK}
+    ${AVFAUDIO_FRAMEWORK}
+    ${AUDIOTOOLBOX_FRAMEWORK}
     ${COREAUDIO_FRAMEWORK}
     ${COREVIDEO_FRAMEWORK}
     ${COREMEDIA_FRAMEWORK}

@@ -3,7 +3,9 @@
 #include "media_input.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <stdexcept>
 
 #ifndef GAV_ENABLE_YTDLP
@@ -96,6 +98,45 @@ findCachedYouTubeFile(NSString *cacheDir, NSString *videoID)
     return fallback;
 }
 
+static NSString *
+findCachedAmbisonicFile(NSString *cacheDir, NSString *videoID)
+{
+    const char *overrideValue = std::getenv("GAV_AMBISONIC_AUDIO");
+    if (overrideValue && *overrideValue) {
+        NSString *overridePath = [NSString stringWithUTF8String:overrideValue];
+        if ([overridePath caseInsensitiveCompare:@"off"] == NSOrderedSame) {
+            return nil;
+        }
+        if ([[NSFileManager defaultManager] fileExistsAtPath:overridePath]) {
+            return overridePath;
+        }
+        std::fprintf(stderr, "[audio] GAV_AMBISONIC_AUDIO does not exist: %s\n", overrideValue);
+    }
+
+    if (videoID.length == 0) {
+        return nil;
+    }
+
+    NSError *error = nil;
+    NSArray<NSString *> *entries = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:cacheDir error:&error];
+    if (!entries) {
+        return nil;
+    }
+
+    NSString *needle = [NSString stringWithFormat:@"[%@]", videoID];
+    NSSet<NSString *> *extensions = [NSSet setWithArray:@[@"webm", @"mka", @"opus", @"ogg", @"m4a", @"mp4"]];
+    for (NSString *entry in entries) {
+        NSString *lower = entry.lowercaseString;
+        if (![entry containsString:needle] ||
+            ![lower containsString:@"ambisonic"] ||
+            ![extensions containsObject:entry.pathExtension.lowercaseString]) {
+            continue;
+        }
+        return [cacheDir stringByAppendingPathComponent:entry];
+    }
+    return nil;
+}
+
 GAVResolvedMediaInput
 gav_resolve_media_input(const char *input)
 {
@@ -104,7 +145,12 @@ gav_resolve_media_input(const char *input)
     }
 
     if (!isHttpURL(input)) {
-        return {input, false};
+        const char *overrideValue = std::getenv("GAV_AMBISONIC_AUDIO");
+        std::string ambisonic;
+        if (overrideValue && *overrideValue && strcasecmp(overrideValue, "off") != 0) {
+            ambisonic = overrideValue;
+        }
+        return {input, false, ambisonic};
     }
 
 #if !GAV_ENABLE_YTDLP
@@ -125,13 +171,20 @@ gav_resolve_media_input(const char *input)
 
         NSString *inputString = [NSString stringWithUTF8String:input];
         NSString *videoID = youtubeVideoID(inputString);
+        NSString *ambisonicPath = findCachedAmbisonicFile(cacheDir, videoID);
+        if (ambisonicPath) {
+            std::printf("[audio] cached ambisonic sidecar: %s\n", ambisonicPath.UTF8String);
+        }
+
         NSString *cachedPath = findCachedYouTubeFile(cacheDir, videoID);
         if (cachedPath) {
             const bool eacHint = filenameSuggestsEAC(cachedPath);
             std::printf("[youtube] cache hit: %s%s\n",
                         cachedPath.UTF8String,
                         eacHint ? " (EAC360)" : "");
-            return {cachedPath.UTF8String, eacHint};
+            return {cachedPath.UTF8String,
+                    eacHint,
+                    ambisonicPath ? (ambisonicPath.UTF8String ?: "") : ""};
         }
 
         NSString *outputTemplate = [cacheDir stringByAppendingPathComponent:
@@ -176,14 +229,13 @@ gav_resolve_media_input(const char *input)
             throw std::runtime_error("yt-dlp did not produce a playable local file");
         }
 
-        // Keep yt-dlp's output filename intact so subsequent runs can reuse it.
-        // EAC is a playback hint, not part of the on-disk cache key.
         const bool eacHint = filenameSuggestsEAC(resolvedPath);
-
         std::printf("[youtube] local file: %s%s\n",
                     resolvedPath.UTF8String,
                     eacHint ? " (EAC360)" : "");
-        return {resolvedPath.UTF8String, eacHint};
+        return {resolvedPath.UTF8String,
+                eacHint,
+                ambisonicPath ? (ambisonicPath.UTF8String ?: "") : ""};
     }
 #endif
 }
