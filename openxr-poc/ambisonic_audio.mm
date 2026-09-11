@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,8 @@ struct GAVAmbisonicAudio {
     float sceneUp[3]{0.0f, 1.0f, 0.0f};
     float sceneForward[3]{0.0f, 0.0f, -1.0f};
     bool sceneBasisValid{false};
+    bool traceOrientation{false};
+    uint64_t orientationUpdateCount{0};
 };
 
 namespace {
@@ -304,8 +307,8 @@ GAVAmbisonicAudio *gav_ambisonic_create(const char *sidecarPath)
         state.player.sourceMode = AVAudio3DMixingSourceModeAmbienceBed;
         state.player.reverbBlend = 0.0f;
         // The ambience-bed direction controls the bed's rotation in world space.
-        // Point it along AVAudioEnvironmentNode's default forward axis so that
-        // the ACN/SN3D field is unrotated at the initial headset pose.
+        // Keep the direction that gives the correct static AmbiX orientation;
+        // head motion is applied through the environment listener below.
         state.player.position = AVAudioMake3DPoint(0.0f, 0.0f, -1.0f);
         state.engine.mainMixerNode.outputVolume = 1.0f;
 
@@ -324,6 +327,7 @@ GAVAmbisonicAudio *gav_ambisonic_create(const char *sidecarPath)
 
         auto *audio = new GAVAmbisonicAudio{};
         audio->retainedState = (__bridge_retained void *)state;
+        audio->traceOrientation = std::getenv("GAV_AMBISONIC_TRACE") != nullptr;
         std::printf("[audio] native head-tracked AmbiX enabled (ACN/SN3D -> Apple binaural renderer)\n");
         return audio;
     }
@@ -451,6 +455,7 @@ void gav_ambisonic_set_head_orientation(GAVAmbisonicAudio *audio,
     rotateVector(*orientation, 0.0f, 0.0f, -1.0f, fx, fy, fz);
     rotateVector(*orientation, 0.0f, 1.0f, 0.0f, ux, uy, uz);
 
+    AVAudio3DVectorOrientation requestedOrientation{};
     if (audio->sceneBasisValid) {
         // Express the current headset orientation in the coordinate system
         // captured at recenter/initial gaze. In that local system +X is right,
@@ -462,12 +467,30 @@ void gav_ambisonic_set_head_orientation(GAVAmbisonicAudio *audio,
         const float localUpY = dot3(ux, uy, uz, audio->sceneUp);
         const float localUpZ = -dot3(ux, uy, uz, audio->sceneForward);
 
-        state.environment.listenerVectorOrientation = AVAudioMake3DVectorOrientation(
+        requestedOrientation = AVAudioMake3DVectorOrientation(
             AVAudioMake3DVector(localForwardX, localForwardY, localForwardZ),
             AVAudioMake3DVector(localUpX, localUpY, localUpZ));
     } else {
-        state.environment.listenerVectorOrientation = AVAudioMake3DVectorOrientation(
+        requestedOrientation = AVAudioMake3DVectorOrientation(
             AVAudioMake3DVector(fx, fy, fz),
             AVAudioMake3DVector(ux, uy, uz));
+    }
+
+    // Apple documents listenerVectorOrientation and listenerAngularOrientation
+    // as linked representations of the same listener pose. Native Ambisonic
+    // examples drive the angular property, however, so explicitly commit the
+    // equivalent angular value after calculating our pose with vectors. This
+    // keeps the robust OpenXR basis conversion above while using the code path
+    // known to update ambience-bed rendering.
+    state.environment.listenerVectorOrientation = requestedOrientation;
+    const AVAudio3DAngularOrientation angular = state.environment.listenerAngularOrientation;
+    state.environment.listenerAngularOrientation = angular;
+
+    ++audio->orientationUpdateCount;
+    if (audio->traceOrientation && (audio->orientationUpdateCount % 180u) == 1u) {
+        std::printf("[audio] listener pose yaw=%+.1f pitch=%+.1f roll=%+.1f deg\n",
+                    angular.yaw,
+                    angular.pitch,
+                    angular.roll);
     }
 }
