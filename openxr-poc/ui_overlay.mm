@@ -16,6 +16,7 @@ namespace {
 
 constexpr size_t kWidth = 1024;
 constexpr size_t kHeight = 512;
+constexpr int kPickerRows = 6;
 
 struct PickerEntry {
     std::string path;
@@ -28,13 +29,35 @@ void setFill(CGContextRef ctx, CGFloat r, CGFloat g, CGFloat b, CGFloat a = 1.0)
     CGContextSetRGBFillColor(ctx, r, g, b, a);
 }
 
-void fillRounded(CGContextRef ctx, CGRect rect, CGFloat radius,
-                 CGFloat r, CGFloat g, CGFloat b, CGFloat a = 1.0)
+void fillRounded(CGContextRef ctx,
+                 CGRect rect,
+                 CGFloat radius,
+                 CGFloat r,
+                 CGFloat g,
+                 CGFloat b,
+                 CGFloat a = 1.0)
 {
     CGPathRef path = CGPathCreateWithRoundedRect(rect, radius, radius, nullptr);
     setFill(ctx, r, g, b, a);
     CGContextAddPath(ctx, path);
     CGContextFillPath(ctx);
+    CGPathRelease(path);
+}
+
+void strokeRounded(CGContextRef ctx,
+                   CGRect rect,
+                   CGFloat radius,
+                   CGFloat r,
+                   CGFloat g,
+                   CGFloat b,
+                   CGFloat a,
+                   CGFloat width)
+{
+    CGPathRef path = CGPathCreateWithRoundedRect(rect, radius, radius, nullptr);
+    CGContextSetRGBStrokeColor(ctx, r, g, b, a);
+    CGContextSetLineWidth(ctx, width);
+    CGContextAddPath(ctx, path);
+    CGContextStrokePath(ctx);
     CGPathRelease(path);
 }
 
@@ -181,6 +204,7 @@ struct GAVUIOverlay {
     std::vector<PickerEntry> pickerEntries;
     int pickerSelection{0};
     int pickerOffset{0};
+    int pickerBottomSelection{-1}; // ▲, ▼, Drives, Cancel. -1 = file list
     std::string actionPath;
     bool dirty{true};
     double lastDraw{0.0};
@@ -203,7 +227,8 @@ static void loadPickerDirectory(GAVUIOverlay *ui, const std::string &path)
     NSArray<NSString *> *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir
                                                                                        error:&error];
     if (!names) {
-        std::fprintf(stderr, "[ui] could not read %s: %s\n",
+        std::fprintf(stderr,
+                     "[ui] could not read %s: %s\n",
                      path.c_str(),
                      error.localizedDescription.UTF8String ?: "unknown error");
         return;
@@ -216,6 +241,7 @@ static void loadPickerDirectory(GAVUIOverlay *ui, const std::string &path)
         NSString *full = [dir stringByAppendingPathComponent:name];
         BOOL childIsDir = NO;
         if (![[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&childIsDir]) continue;
+
         PickerEntry entry;
         entry.path = full.UTF8String ?: "";
         entry.name = name.UTF8String ?: "";
@@ -250,6 +276,7 @@ static void loadPickerDirectory(GAVUIOverlay *ui, const std::string &path)
     ui->pickerDir = dir.UTF8String ?: path;
     ui->pickerSelection = 0;
     ui->pickerOffset = 0;
+    ui->pickerBottomSelection = -1;
     ui->dirty = true;
 }
 
@@ -282,7 +309,7 @@ static void drawTimeline(GAVUIOverlay *ui, CGContextRef ctx)
         fraction = std::clamp(ui->currentSeconds / ui->durationSeconds, 0.0, 1.0);
     }
 
-    fillRounded(ctx, track, 6, 0.30, 0.32, 0.38, 1.0);
+    fillRounded(ctx, track, 6, 0.30, 0.32, 0.38, 0.92);
     if (fraction > 0.0) {
         fillRounded(ctx,
                     CGRectMake(track.origin.x,
@@ -311,17 +338,19 @@ static void drawTimeline(GAVUIOverlay *ui, CGContextRef ctx)
     releaseTextLine(durationLine);
 }
 
-static void drawControlButton(CGContextRef ctx,
-                              CGRect rect,
-                              const std::string &label,
-                              bool selected)
+static void drawButton(CGContextRef ctx,
+                       CGRect rect,
+                       const std::string &label,
+                       bool selected,
+                       CGFloat fontSize)
 {
     if (selected) {
-        fillRounded(ctx, rect, 14, 0.36, 0.42, 0.95, 1.0);
+        fillRounded(ctx, rect, 14, 0.36, 0.42, 0.95, 0.95);
     } else {
-        fillRounded(ctx, rect, 14, 0.20, 0.22, 0.27, 1.0);
+        fillRounded(ctx, rect, 14, 0.20, 0.22, 0.27, 0.90);
     }
-    drawCenteredText(ctx, label, rect, 32);
+    strokeRounded(ctx, rect, 14, 1.0, 1.0, 1.0, selected ? 0.16 : 0.08, 1.0);
+    drawCenteredText(ctx, label, rect, fontSize);
 }
 
 static void drawControls(GAVUIOverlay *ui, CGContextRef ctx)
@@ -347,10 +376,11 @@ static void drawControls(GAVUIOverlay *ui, CGContextRef ctx)
     };
 
     for (int i = 0; i < 3; ++i) {
-        drawControlButton(ctx,
-                          CGRectMake(x0 + i * (buttonW + gap), y, buttonW, buttonH),
-                          buttons[i].label,
-                          ui->controlSelection == buttons[i].actionIndex);
+        drawButton(ctx,
+                   CGRectMake(x0 + i * (buttonW + gap), y, buttonW, buttonH),
+                   buttons[i].label,
+                   ui->controlSelection == buttons[i].actionIndex,
+                   32);
     }
 
     drawCenteredText(ctx,
@@ -367,31 +397,31 @@ static void drawPicker(GAVUIOverlay *ui, CGContextRef ctx)
     folder = shortenedLabel(folder, 48);
     drawText(ctx, "Files — " + folder, 28, 458, 28, 0.94, 0.95, 0.97);
 
-    constexpr int rows = 6;
     constexpr CGFloat rowH = 54.0;
     constexpr CGFloat gap = 8.0;
     constexpr CGFloat x0 = 24.0;
     constexpr CGFloat width = 976.0;
 
     if (ui->pickerSelection < ui->pickerOffset) ui->pickerOffset = ui->pickerSelection;
-    if (ui->pickerSelection >= ui->pickerOffset + rows) {
-        ui->pickerOffset = ui->pickerSelection - rows + 1;
+    if (ui->pickerSelection >= ui->pickerOffset + kPickerRows) {
+        ui->pickerOffset = ui->pickerSelection - kPickerRows + 1;
     }
 
-    for (int row = 0; row < rows; ++row) {
+    for (int row = 0; row < kPickerRows; ++row) {
         const int index = ui->pickerOffset + row;
         if (index >= static_cast<int>(ui->pickerEntries.size())) break;
         const PickerEntry &entry = ui->pickerEntries[index];
         const CGFloat yTop = 76.0 + row * (rowH + gap);
         const CGFloat y = static_cast<CGFloat>(kHeight) - yTop - rowH;
         const CGRect rect = CGRectMake(x0, y, width, rowH);
-        const bool selected = index == ui->pickerSelection;
+        const bool selected = ui->pickerBottomSelection < 0 && index == ui->pickerSelection;
 
         if (selected) {
-            fillRounded(ctx, rect, 14, 0.36, 0.42, 0.95, 1.0);
+            fillRounded(ctx, rect, 14, 0.36, 0.42, 0.95, 0.95);
         } else {
-            fillRounded(ctx, rect, 14, 0.20, 0.22, 0.27, 1.0);
+            fillRounded(ctx, rect, 14, 0.20, 0.22, 0.27, 0.88);
         }
+        strokeRounded(ctx, rect, 14, 1.0, 1.0, 1.0, selected ? 0.15 : 0.06, 1.0);
 
         std::string icon;
         if (entry.directory) {
@@ -413,11 +443,18 @@ static void drawPicker(GAVUIOverlay *ui, CGContextRef ctx)
                          0.76, 0.78, 0.83);
     }
 
-    drawCenteredText(ctx,
-                     "D-pad ↑/↓: choose    Cross: open    Circle: player",
-                     CGRectMake(20, 10, kWidth - 40, 48),
-                     18,
-                     0.67, 0.69, 0.75);
+    const CGFloat bottomY = 10.0;
+    const CGFloat bottomH = 56.0;
+    const CGFloat bottomGap = 8.0;
+    const CGFloat bottomW = (width - bottomGap * 3.0) / 4.0;
+    const char *bottomLabels[] = {"▲", "▼", "💾 Drives", "Cancel"};
+    for (int i = 0; i < 4; ++i) {
+        drawButton(ctx,
+                   CGRectMake(x0 + i * (bottomW + bottomGap), bottomY, bottomW, bottomH),
+                   bottomLabels[i],
+                   ui->pickerBottomSelection == i,
+                   i == 2 ? 24 : 26);
+    }
 }
 
 static void redraw(GAVUIOverlay *ui)
@@ -441,12 +478,11 @@ static void redraw(GAVUIOverlay *ui)
 
     CGContextClearRect(ctx, CGRectMake(0, 0, kWidth, kHeight));
 
-    // Match the original GAV overlay: one restrained charcoal plate rather
-    // than the nested-card treatment used by the first OpenXR placeholder.
-    fillRounded(ctx,
-                CGRectMake(4, 4, kWidth - 8, kHeight - 8),
-                28,
-                0.07, 0.08, 0.10, 1.0);
+    // Match the original GAV overlay's glass-like plate. CoreGraphics stores
+    // premultiplied alpha here; the Metal shader composites it over video.
+    const CGRect plate = CGRectMake(4, 4, kWidth - 8, kHeight - 8);
+    fillRounded(ctx, plate, 28, 0.07, 0.08, 0.10, 0.84);
+    strokeRounded(ctx, plate, 28, 1.0, 1.0, 1.0, 0.11, 1.2);
 
     if (ui->pickerMode) drawPicker(ui, ctx);
     else drawControls(ui, ctx);
@@ -499,6 +535,7 @@ void gav_ui_set_current_path(GAVUIOverlay *ui, const char *path)
     ui->currentPath = path ? path : "";
     ui->currentName = basenameForPath(ui->currentPath);
     ui->pickerMode = false;
+    ui->pickerBottomSelection = -1;
     ui->dirty = true;
 }
 
@@ -532,6 +569,7 @@ int gav_ui_process_controller(GAVUIOverlay *ui,
     if ((snapshot->uiToggle & 1) != 0) {
         ui->visible = !ui->visible;
         if (ui->visible) ui->pickerMode = false;
+        ui->pickerBottomSelection = -1;
         ui->dirty = true;
         redraw(ui);
         return ui->visible ? 1 : 0;
@@ -542,6 +580,7 @@ int gav_ui_process_controller(GAVUIOverlay *ui,
     if (snapshot->uiBack != 0) {
         if (ui->pickerMode) {
             ui->pickerMode = false;
+            ui->pickerBottomSelection = -1;
         } else {
             ui->visible = false;
         }
@@ -551,25 +590,78 @@ int gav_ui_process_controller(GAVUIOverlay *ui,
     }
 
     if (ui->pickerMode) {
-        if (snapshot->uiNavY != 0 && !ui->pickerEntries.empty()) {
-            ui->pickerSelection = std::clamp(ui->pickerSelection + snapshot->uiNavY,
-                                             0,
-                                             static_cast<int>(ui->pickerEntries.size()) - 1);
+        const int lastIndex = static_cast<int>(ui->pickerEntries.size()) - 1;
+
+        if (snapshot->uiNavX != 0) {
+            if (ui->pickerBottomSelection < 0) {
+                // The original GAV panel keeps Drives permanently reachable at
+                // the bottom. Horizontal navigation jumps there directly.
+                ui->pickerBottomSelection = 2;
+            } else {
+                ui->pickerBottomSelection = std::clamp(
+                    ui->pickerBottomSelection + snapshot->uiNavX, 0, 3);
+            }
             ui->dirty = true;
         }
-        if (snapshot->uiSelect != 0 && !ui->pickerEntries.empty()) {
-            const PickerEntry entry = ui->pickerEntries[ui->pickerSelection];
-            if (entry.directory) {
-                loadPickerDirectory(ui, entry.path);
-            } else if (action) {
-                ui->actionPath = entry.path;
-                action->type = GAV_UI_ACTION_OPEN_PATH;
-                action->path = ui->actionPath.c_str();
-                ui->pickerMode = false;
-                ui->visible = false;
-                ui->dirty = true;
+
+        if (snapshot->uiNavY != 0) {
+            if (ui->pickerBottomSelection >= 0) {
+                if (snapshot->uiNavY < 0) {
+                    ui->pickerBottomSelection = -1;
+                }
+            } else if (lastIndex >= 0) {
+                const int next = ui->pickerSelection + snapshot->uiNavY;
+                if (next > lastIndex) {
+                    ui->pickerBottomSelection = 2;
+                } else {
+                    ui->pickerSelection = std::clamp(next, 0, lastIndex);
+                }
+            } else if (snapshot->uiNavY > 0) {
+                ui->pickerBottomSelection = 2;
+            }
+            ui->dirty = true;
+        }
+
+        if (snapshot->uiSelect != 0) {
+            if (ui->pickerBottomSelection >= 0) {
+                switch (ui->pickerBottomSelection) {
+                    case 0: // page up
+                        if (lastIndex >= 0) {
+                            ui->pickerSelection = std::max(0, ui->pickerSelection - kPickerRows);
+                            ui->pickerBottomSelection = -1;
+                        }
+                        break;
+                    case 1: // page down
+                        if (lastIndex >= 0) {
+                            ui->pickerSelection = std::min(lastIndex,
+                                                           ui->pickerSelection + kPickerRows);
+                            ui->pickerBottomSelection = -1;
+                        }
+                        break;
+                    case 2: // Drives
+                        loadPickerDirectory(ui, "/Volumes");
+                        break;
+                    case 3: // Cancel
+                        ui->pickerMode = false;
+                        ui->pickerBottomSelection = -1;
+                        break;
+                }
+            } else if (lastIndex >= 0) {
+                const PickerEntry entry = ui->pickerEntries[ui->pickerSelection];
+                if (entry.directory) {
+                    loadPickerDirectory(ui, entry.path);
+                } else if (action) {
+                    ui->actionPath = entry.path;
+                    action->type = GAV_UI_ACTION_OPEN_PATH;
+                    action->path = ui->actionPath.c_str();
+                    ui->pickerMode = false;
+                    ui->visible = false;
+                    ui->pickerBottomSelection = -1;
+                    ui->dirty = true;
+                }
             }
         }
+
         if (ui->dirty) redraw(ui);
         return 1;
     }
