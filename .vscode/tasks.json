@@ -1,0 +1,44 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build Player",
+      "type": "process",
+      "command": "make",
+      "options": {
+        "cwd": "${workspaceFolder}/player"
+      },
+      "problemMatcher": "$gcc",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "detail": "Builds player/PSVR2Player.app"
+    },
+    {
+      "label": "Clean Player",
+      "type": "process",
+      "command": "make",
+      "args": [
+        "clean"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/player"
+      },
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Removes the player build outputs"
+    },
+    {
+      "label": "Rebuild Player",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "Clean Player",
+        "Build Player"
+      ],
+      "problemMatcher": [],
+      "group": "build",
+      "detail": "Cleans and rebuilds player/PSVR2Player.app"
+    }
+  ]
+}

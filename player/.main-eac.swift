@@ -53,10 +53,74 @@ constant float FX = 0.3585564;
 constant float FY = 0.3762281;
 constant float PI = 3.14159265358979;
 
+// YouTube/FFmpeg Equi-Angular Cubemap (EAC), 3x2 layout.
+// Face packing matches FFmpeg v360 prepare_eac_in():
+//   top:    LEFT | FRONT | RIGHT
+//   bottom: DOWN | BACK  | UP
+// Bottom faces use the same rotations as FFmpeg (270, 90, 270 degrees).
+// GAV uses x-right/y-up/-z-forward; FFmpeg's cubemap convention is
+// x-right/y-down/+z-forward, hence the axis conversion below.
+static float2 project_eac(float3 w) {
+    float3 p = float3(w.x, -w.y, -w.z);
+    float ax = fabs(p.x), ay = fabs(p.y), az = fabs(p.z);
+
+    float uf = 0.0, vf = 0.0;
+    int col = 1, row = 0;
+    int rotation = 0; // 0, 1=90, 3=270
+
+    if (ax >= ay && ax >= az) {
+        if (p.x >= 0.0) { // RIGHT -> top right
+            uf = -p.z / p.x;
+            vf =  p.y / p.x;
+            col = 2; row = 0;
+        } else {          // LEFT -> top left
+            uf = -p.z / p.x;
+            vf = -p.y / p.x;
+            col = 0; row = 0;
+        }
+    } else if (ay >= ax && ay >= az) {
+        if (p.y >= 0.0) { // DOWN -> bottom left, rotate 270
+            uf =  p.x / p.y;
+            vf = -p.z / p.y;
+            col = 0; row = 1; rotation = 3;
+        } else {          // UP -> bottom right, rotate 270
+            uf = -p.x / p.y;
+            vf = -p.z / p.y;
+            col = 2; row = 1; rotation = 3;
+        }
+    } else {
+        if (p.z >= 0.0) { // FRONT -> top middle
+            uf = p.x / p.z;
+            vf = p.y / p.z;
+            col = 1; row = 0;
+        } else {          // BACK -> bottom middle, rotate 90
+            uf = p.x / p.z;
+            vf = -p.y / p.z;
+            col = 1; row = 1; rotation = 1;
+        }
+    }
+
+    if (rotation == 1) {
+        float t = uf; uf = -vf; vf = t;
+    } else if (rotation == 3) {
+        float t = -uf; uf = vf; vf = t;
+    }
+
+    // EAC differs from a normal cubemap by applying atan independently to
+    // each face coordinate before packing it into the 3x2 texture.
+    uf = (2.0 / PI) * atan(uf) + 0.5;
+    vf = (2.0 / PI) * atan(vf) + 0.5;
+    return float2((uf + float(col)) / 3.0,
+                  (vf + float(row)) / 2.0);
+}
 static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad, float shift, thread bool &valid) {
     float u, v;
     valid = true;
-    if (mode == 2) {
+    if (mode == 3) {
+        float2 eac = project_eac(w);
+        u = eac.x;
+        v = eac.y;
+    } else if (mode == 2) {
         // equidistant fisheye, forward axis -Z
         float cosT = clamp(-w.z, -1.0, 1.0);
         float theta = acos(cosT);
@@ -302,12 +366,15 @@ enum Projection: Int32, CaseIterable {
     case equirect360 = 0
     case equirect180 = 1
     case fisheye = 2
+    case eac360 = 3
 
     var label: String {
         switch self {
         case .equirect360: return "equirect 360°"
         case .equirect180: return "half-equirect 180°"
         case .fisheye: return "fisheye"
+        case .eac360: return "EAC 360°"
+        case .eac360: return "YouTube EAC 360°"
         }
     }
 
@@ -358,7 +425,9 @@ struct PlaybackConfig {
         var cfg = PlaybackConfig()
         let n = name.uppercased()
 
-        if n.contains("FISHEYE") || n.contains("VR180FISH") {
+        if n.contains("EAC360") || n.contains("_EAC") {
+            cfg.projection = .eac360
+        } else if n.contains("FISHEYE") || n.contains("VR180FISH") {
             cfg.projection = .fisheye
             if let range = n.range(of: #"FISHEYE(\d{3})"#, options: .regularExpression) {
                 let digits = n[range].dropFirst("FISHEYE".count)
@@ -374,7 +443,7 @@ struct PlaybackConfig {
             cfg.stereo = .tb
         } else if n.contains("SBS") || n.contains("_LR") || n.contains("SIDEBYSIDE") || n.contains("180") || n.contains("FISHEYE") {
             cfg.stereo = .sbs
-        } else if cfg.projection == .equirect360 {
+        } else if cfg.projection == .equirect360 || cfg.projection == .eac360 {
             cfg.stereo = .mono
         }
         return cfg
@@ -1507,81 +1576,12 @@ final class PlayerView: MTKView {
             print("[player] seek to \(Int(item.duration.seconds * f)) s")
         }
     }
-
-    // MARK: Game controller
-
-    func gamepadToggleMenu() {
-        guard let r = renderer, let overlay = r.overlay else { return }
-        // Passthrough normally suppresses all UI. Menu exits it first so the
-        // controls can be shown rather than silently ignoring the button.
-        if r.passthrough?.active == true { r.togglePassthrough() }
-        overlay.toggleFromController()
-    }
-
-    func gamepadPrimary() {
-        guard let overlay = renderer?.overlay else { return }
-        if overlay.active {
-            if let action = overlay.activateFromController() {
-                perform(uiAction: action)
-                overlay.redrawSoon()
-            }
-        } else {
-            perform(uiAction: .playPause)
-        }
-    }
-
-    func gamepadSecondary() {
-        renderer?.overlay?.backFromController()
-    }
-
-    func gamepadDirection(_ direction: ControllerNavigationDirection,
-                          fromStick: Bool, repeated: Bool) {
-        guard let overlay = renderer?.overlay else { return }
-        if overlay.active {
-            overlay.moveFromController(direction)
-            return
-        }
-        // The left stick is menu-only, avoiding accidental playback commands.
-        // D-pad volume repeats when held; seeking remains one jump per press.
-        if fromStick || (repeated && (direction == .left || direction == .right)) { return }
-        switch direction {
-        case .left: perform(uiAction: .seekBack)
-        case .right: perform(uiAction: .seekFwd)
-        case .up: perform(uiAction: .volUp)
-        case .down: perform(uiAction: .volDown)
-        }
-    }
-
-    func gamepadShoulder(forward: Bool) {
-        guard let overlay = renderer?.overlay else { return }
-        if overlay.active {
-            overlay.pageFromController(forward ? 6 : -6)
-        } else {
-            perform(uiAction: forward ? .seekFwd : .seekBack)
-        }
-    }
-
-    func gamepadRecenter() {
-        perform(uiAction: .recenter)
-    }
-
-    func gamepadPassthrough() {
-        guard let r = renderer, r.overlay?.active != true else { return }
-        r.togglePassthrough()
-    }
-
-    func gamepadRotate(dx: Double, dy: Double) {
-        guard let r = renderer, r.overlay?.active != true,
-              r.passthrough?.active != true else { return }
-        r.tracker.addManualRotation(dxPx: dx, dyPx: dy)
-    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var renderer: Renderer!
     var keyMonitor: Any?
-    var gamepadInput: GamepadInput?
     var cvLink: CVDisplayLink?
     var headsetDisplayID: CGDirectDisplayID = 0
     // No headset display at launch — rendering to a window on the monitor
@@ -1698,7 +1698,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.isPaused = true
         view.enableSetNeedsDisplay = false
         playerView = view
-        gamepadInput = GamepadInput(view: view)
 
         if vrScreen != nil {
             // The borderless headset window intentionally does NOT become key:
@@ -1774,18 +1773,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var linkOut: CVDisplayLink?
         CVDisplayLinkCreateWithCGDisplay(displayID, &linkOut)
         if let link = linkOut {
-            // Never build a backlog of stale draw blocks on the main queue.
-            // Besides increasing display latency, that backlog delays keyboard
-            // and controller actions which must also update player/UI state on
-            // the main thread. One outstanding frame is enough: if it has not
-            // run by the next display-link tick, drop that tick.
-            let drawGate = DispatchSemaphore(value: 1)
             CVDisplayLinkSetOutputHandler(link) { [weak self] _, _, _, _, _ in
-                guard drawGate.wait(timeout: .now()) == .success else {
-                    return kCVReturnSuccess
-                }
                 DispatchQueue.main.async {
-                    defer { drawGate.signal() }
                     self?.playerView?.draw()
                 }
                 return kCVReturnSuccess
@@ -1814,7 +1803,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let deskScreen = NSScreen.screens.first {
             !$0.localizedName.localizedCaseInsensitiveContains("PS VR2")
         } ?? NSScreen.main!
-        let size = NSSize(width: 620, height: 620)
+        let size = NSSize(width: 620, height: 578)
         let frame = NSRect(
             x: deskScreen.visibleFrame.maxX - size.width - 24,
             y: deskScreen.visibleFrame.minY + 24,
@@ -1880,12 +1869,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addRow("Stereo depth", id: "depth", key: ", / .")
         addRow("Fisheye FOV", id: "fov", key: "+ / −")
         addHeader("Cameras (passthrough)")
-        addRow("Mode", id: "pt", key: "B · headset Fn ×2")
+        addRow("Mode", id: "pt", key: "B · double Fn")
         addRow("Stereo/mono", id: "ptmode", key: "M")
         addRow("Convergence", id: "ptconv", key: ", / .")
         addRow("Lens angle", id: "ptfov", key: "+ / −")
         addHeader("Headset and tracking")
-        addRow("Controller", id: "pad", key: "Menu · A/B")
         addRow("Tracking", id: "track", key: "")
         addRow("Pose prediction", id: "pred", key: "P")
         addRow("Lookahead", id: "look", key: "[ / ]")
@@ -1898,13 +1886,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         grid.column(at: 2).xPlacement = .trailing
 
         let footer = NSTextField(wrappingLabelWithString:
-            "R key — recenter · PS VR2 Fn button (under the visor, not the Mac keyboard Fn): "
-            + "single — recenter · double — camera view · long — center on gaze\n"
+            "Fn button: single — recenter · double — camera view · long — center on gaze\n"
             + "Mouse: move — panel · click — select · right-drag — tilt scene · wheel — file list\n"
             + "Touchpad: same — two fingers scroll the list, a two-finger press "
-            + "with a drag tilts the scene\n"
-            + "Controller: Menu — panel · A/Cross — select or play/pause · B/Circle — back\n"
-            + "D-pad ←/→ or L1/R1 — ±15 s · ↑/↓ — volume · Y/Triangle — recenter · X/Square — camera")
+            + "with a drag tilts the scene")
         footer.font = .systemFont(ofSize: 11.5)
         footer.textColor = .tertiaryLabelColor
 
@@ -1961,7 +1946,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             set("vol", "—")
         }
         set("rate", String(format: "%g×", r.playbackRate))
-        set("pad", gamepadInput?.connectedName ?? "not connected")
 
         let cfg = r.config
         set("proj", cfg.projection.label)

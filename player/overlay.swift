@@ -22,6 +22,10 @@ enum UIAction {
     case seekFraction(Double) // seek to a fraction of the duration (timeline)
 }
 
+enum ControllerNavigationDirection: Equatable {
+    case up, down, left, right
+}
+
 final class UIOverlay {
     static let texW = 1024
     static let texH = 512
@@ -114,6 +118,9 @@ final class UIOverlay {
     private var lastButtonHeld = 0.0
     private var savedMousePos: CGPoint?
     private var lastHovered: Int = -1
+    private var controllerFocusedIndex: Int?
+    private var controllerNavigationActive = false
+    private var ignoreMouseMovementUntil = 0.0
 
     // Timeline knob dragging: while LMB is held, the cursor position sets
     // the target fraction; the seek itself runs on release
@@ -190,6 +197,7 @@ final class UIOverlay {
                 String(format: "%g×", self?.renderer?.playbackRate ?? 1)
             }, action: .cycleSpeed),
         ]
+        restoreControllerFocus()
     }
 
     // MARK: - Buttons: "Format" submenu
@@ -240,6 +248,7 @@ final class UIOverlay {
         buttons.append(Button(
             rect: CGRect(x: (Double(Self.texW) - 300) / 2, y: 14, width: 300, height: 56),
             label: { "Done" }, action: .formatDone))
+        restoreControllerFocus()
     }
 
     // MARK: - Buttons: file picker mode
@@ -385,6 +394,7 @@ final class UIOverlay {
                 rect: CGRect(x: x0 + Double(i) * (bw + gap), y: by, width: bw, height: bh),
                 label: { item.0 }, action: item.1))
         }
+        restoreControllerFocus()
     }
 
     // Return to the previous position; if the open file is in this folder — to it
@@ -411,6 +421,175 @@ final class UIOverlay {
         redrawSoon()
     }
 
+    // MARK: - Controller navigation
+
+    // The panel is geometrically laid out rather than built from AppKit controls.
+    // Controller focus therefore reuses the existing button rectangles and moves
+    // the virtual cursor to the selected button, keeping mouse and gamepad visuals
+    // identical.
+    func toggleFromController() {
+        if active {
+            // With no video the picker is intentionally always visible. Treat
+            // Menu as "take controller focus" instead of hiding for one frame.
+            if renderer?.video == nil {
+                controllerNavigationActive = true
+                focusInitialButton()
+                return
+            }
+            hide()
+            return
+        }
+        controllerNavigationActive = true
+        show()
+        focusInitialButton()
+    }
+
+    func moveFromController(_ direction: ControllerNavigationDirection) {
+        guard active, !buttons.isEmpty else { return }
+        controllerNavigationActive = true
+        lastActivity = CACurrentMediaTime()
+
+        if controllerFocusedIndex == nil || !isFocusable(controllerFocusedIndex!) {
+            focusInitialButton()
+            return
+        }
+        guard let current = controllerFocusedIndex else { return }
+
+        // Walking off either end of the visible file rows scrolls by one row,
+        // so a held D-pad feels like a continuous list rather than six buttons.
+        if mode == .picker, isEntryButton(buttons[current]) {
+            let entryCount = buttons.prefix { isEntryButton($0) }.count
+            if direction == .up, current == 0, pickerScroll > 0 {
+                let target = current
+                scrollPicker(rows: -1)
+                focusButton(target)
+                return
+            }
+            if direction == .down, current == entryCount - 1,
+               pickerScroll + entryCount < pickerEntries.count {
+                let target = current
+                scrollPicker(rows: 1)
+                focusButton(min(target, buttons.count - 1))
+                return
+            }
+        }
+
+        let origin = CGPoint(x: buttons[current].rect.midX, y: buttons[current].rect.midY)
+        var best: (index: Int, score: Double)?
+        for i in buttons.indices where i != current && isFocusable(i) {
+            let point = CGPoint(x: buttons[i].rect.midX, y: buttons[i].rect.midY)
+            let dx = point.x - origin.x
+            let dy = point.y - origin.y
+            let primary: Double
+            let perpendicular: Double
+            switch direction {
+            case .up where dy > 1: primary = dy; perpendicular = abs(dx)
+            case .down where dy < -1: primary = -dy; perpendicular = abs(dx)
+            case .left where dx < -1: primary = -dx; perpendicular = abs(dy)
+            case .right where dx > 1: primary = dx; perpendicular = abs(dy)
+            default: continue
+            }
+            // Strongly prefer an aligned row/column, then the closest target.
+            let score = primary + perpendicular * 3
+            if best == nil || score < best!.score {
+                best = (i, score)
+            }
+        }
+        if let best { focusButton(best.index) }
+    }
+
+    func pageFromController(_ rows: Int) {
+        guard active, mode == .picker else { return }
+        controllerNavigationActive = true
+        scrollPicker(rows: rows)
+        let entryCount = buttons.prefix { isEntryButton($0) }.count
+        guard entryCount > 0 else { return }
+        focusButton(rows < 0 ? 0 : entryCount - 1)
+    }
+
+    func activateFromController() -> UIAction? {
+        guard active else { return nil }
+        controllerNavigationActive = true
+        lastActivity = CACurrentMediaTime()
+        if controllerFocusedIndex == nil { focusInitialButton() }
+        guard let index = controllerFocusedIndex, isFocusable(index) else { return nil }
+        return activateButton(at: index)
+    }
+
+    func backFromController() {
+        guard active else { return }
+        controllerNavigationActive = true
+        switch mode {
+        case .format:
+            mode = .controls
+            buildControlButtons()
+            if let index = buttons.firstIndex(where: {
+                if case .showFormat = $0.action { return true }
+                return false
+            }) { focusButton(index) }
+        case .picker:
+            if renderer?.video != nil {
+                mode = .controls
+                metaCache.cancelPending()
+                buildControlButtons()
+            } else if let index = buttons.firstIndex(where: {
+                if case .pickerEntry(let entry) = $0.action {
+                    return pickerEntries.indices.contains(entry) && pickerEntries[entry].name == ".."
+                }
+                return false
+            }) {
+                _ = activateButton(at: index)
+            }
+        case .controls:
+            hide()
+        }
+    }
+
+    private func isFocusable(_ index: Int) -> Bool {
+        guard buttons.indices.contains(index) else { return false }
+        if case .timeline = buttons[index].action { return false }
+        return true
+    }
+
+    private func focusInitialButton() {
+        guard active else { return }
+        let preferred: Int?
+        switch mode {
+        case .controls:
+            preferred = buttons.firstIndex {
+                if case .ui(.playPause) = $0.action { return true }
+                return false
+            }
+        case .picker:
+            preferred = buttons.firstIndex(where: { isEntryButton($0) })
+        case .format:
+            preferred = buttons.firstIndex(where: { $0.highlighted })
+        }
+        if let index = preferred ?? buttons.indices.first(where: { isFocusable($0) }) {
+            focusButton(index)
+        }
+    }
+
+    private func restoreControllerFocus() {
+        controllerFocusedIndex = nil
+        if controllerNavigationActive && active {
+            focusInitialButton()
+        }
+    }
+
+    private func focusButton(_ index: Int) {
+        guard isFocusable(index) else { return }
+        controllerFocusedIndex = index
+        let center = CGPoint(x: buttons[index].rect.midX, y: buttons[index].rect.midY)
+        cursorU = center.x / Double(Self.texW)
+        cursorV = 1 - center.y / Double(Self.texH)
+        lastActivity = CACurrentMediaTime()
+        // Capturing the pointer can report the warp as a mouse delta on the
+        // following frame. Do not let that immediately steal controller focus.
+        ignoreMouseMovementUntil = lastActivity + 0.15
+        redrawSoon()
+    }
+
     // MARK: - Lifecycle
 
     // Called every frame from the render loop
@@ -426,7 +605,9 @@ final class UIOverlay {
             lastButtonHeld = CACurrentMediaTime()
         }
 
-        if moved && NSApp.isActive {
+        if moved && NSApp.isActive && CACurrentMediaTime() >= ignoreMouseMovementUntil {
+            controllerFocusedIndex = nil
+            controllerNavigationActive = false
             lastActivity = CACurrentMediaTime()
             if active && !rightHeld {
                 cursorU = min(1 + Self.marginU, max(-Self.marginU, cursorU + Double(dx) / 900.0))
@@ -571,6 +752,8 @@ final class UIOverlay {
     func hide() {
         guard active else { return }
         active = false
+        controllerFocusedIndex = nil
+        controllerNavigationActive = false
         releasedForDialog = false
         // The format submenu doesn't survive hiding the panel
         if mode == .format {
@@ -592,6 +775,8 @@ final class UIOverlay {
 
     // Click on the panel; returns an action for the player if its button was hit
     func click() -> UIAction? {
+        controllerFocusedIndex = nil
+        controllerNavigationActive = false
         lastActivity = CACurrentMediaTime()
         let idx = hitIndex()
         guard idx >= 0 else {
@@ -604,6 +789,11 @@ final class UIOverlay {
             return nil
         }
 
+        return activateButton(at: idx)
+    }
+
+    private func activateButton(at idx: Int) -> UIAction? {
+        guard buttons.indices.contains(idx) else { return nil }
         switch buttons[idx].action {
         case .ui(let action):
             return action

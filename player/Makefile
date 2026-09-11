@@ -18,11 +18,11 @@ $(GENERATED_MAIN): main.swift generate-eac-main.swift
 	mkdir -p $(GENERATED_DIR)
 	swift generate-eac-main.swift main.swift $(GENERATED_MAIN)
 
-psvr2player: $(GENERATED_MAIN) overlay.swift sweeper.swift meta.swift passthrough.swift cpsvr2.o lut.o cpsvr2.h
-	swiftc -O -import-objc-header cpsvr2.h $(GENERATED_MAIN) overlay.swift sweeper.swift meta.swift passthrough.swift cpsvr2.o lut.o \
+psvr2player: $(GENERATED_MAIN) overlay.swift controller.swift sweeper.swift meta.swift passthrough.swift cpsvr2.o lut.o cpsvr2.h
+	swiftc -O -import-objc-header cpsvr2.h $(GENERATED_MAIN) overlay.swift controller.swift sweeper.swift meta.swift passthrough.swift cpsvr2.o lut.o \
 		$(LIBUSB_LDFLAGS) \
 		-framework AppKit -framework Metal -framework MetalKit \
-		-framework AVFoundation -framework CoreAudio -framework CoreVideo \
+		-framework AVFoundation -framework CoreAudio -framework CoreVideo -framework GameController \
 		-o psvr2player
 
 # The bundle is needed for more than launching from Finder: without Info.plist

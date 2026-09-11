@@ -61,6 +61,9 @@ brick) bridges that gap. No software can work around it.
   can click it. Stray windows that land on the headset display are moved
   back to the monitor automatically (needs the Accessibility permission,
   otherwise the player warns you)
+- Game-controller support through macOS's standard extended-gamepad profile
+  (including DualSense over Bluetooth): open and navigate the in-headset menu,
+  control playback, recenter, enter passthrough, and tilt the scene
 
 ## Screenshots
 
@@ -141,6 +144,12 @@ an uncomfortably close scene away; separate from camera convergence) ·
 Mouse: move — panel · click — select · right-drag — tilt scene ·
 wheel — scroll list. Trackpad: two-finger scroll — list, two-finger
 press-drag — tilt scene.
+Controller: Menu/Options — show or hide panel · D-pad/left stick — navigate
+· primary/bottom face button (`Cross`/`A`) — select or play/pause ·
+secondary/right face button (`Circle`/`B`) — back · D-pad left/right or
+L1/R1 — ±15 s · D-pad up/down — volume · top face button
+(`Triangle`/`Y`) — recenter · left face button (`Square`/`X`) — camera
+view · right stick — tilt scene. In the file picker, L1/R1 moves one page.
 Debug: `P` pose prediction · `[`/`]` look-ahead · `S` scanline correction ·
 `C` chromatic correction · `D` vsync.
 
@@ -148,7 +157,8 @@ Debug: `P` pose prediction · `[`/`]` look-ahead · `S` scanline correction ·
 
 - `player/` — the player itself: `main.swift` (AppKit + Metal +
   AVFoundation + the shader), `overlay.swift` (in-headset panel and file
-  picker), `meta.swift` (thumbnail/metadata cache), `sweeper.swift` (moves
+  picker), `controller.swift` (standard game-controller input), `meta.swift`
+  (thumbnail/metadata cache), `sweeper.swift` (moves
   stray windows off the headset display), `passthrough.swift` (camera frames
   to BC4 textures), `cpsvr2.c` (SLAM/IMU/status/camera streams over libusb),
   `lut.c` (distortion table from Monado), `environment.jpg` (the space
