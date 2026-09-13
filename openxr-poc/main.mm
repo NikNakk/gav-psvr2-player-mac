@@ -351,15 +351,19 @@ void renderProjectionEye(id<MTLCommandQueue> commandQueue,
     }
 
     [encoder endEncoding];
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.status == MTLCommandBufferStatusError) {
+            std::fprintf(stderr,
+                         "Metal projection command buffer failed asynchronously: %s\n",
+                         completed.error.localizedDescription.UTF8String ?: "unknown error");
+        }
+    }];
     [commandBuffer commit];
 
-    // Correctness first: Monado's Metal client also inserts an ordered queue
-    // barrier on release. Remove this extra blocking wait only after playback is proven.
-    [commandBuffer waitUntilCompleted];
-    if (commandBuffer.status == MTLCommandBufferStatusError) {
-        throw std::runtime_error(std::string("Metal command buffer failed: ") +
-                                 (commandBuffer.error.localizedDescription.UTF8String ?: "unknown error"));
-    }
+    // Do not block the application CPU here. This is the same queue supplied
+    // in XrGraphicsBindingMetalKHR, so Monado's release-side shared-event signal
+    // is ordered after this render command buffer. The service waits for that
+    // timeline value before making the frame available to the compositor.
 }
 
 } // namespace
@@ -493,11 +497,9 @@ int main(int argc, const char *argv[])
 
                 AVPlayerItem *playerItem = [AVPlayerItem playerItemWithAsset:asset];
                 NSDictionary *pixelBufferAttributes = @{
-                    (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                    (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelBufferType_32BGRA),
                     (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey: @YES,
                 };
-                AVPlayerItemVideoOutput *videoOutput =
-                    [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:pixelBufferAttributes];
                 [playerItem addOutput:videoOutput];
 
                 AVPlayer *player = [AVPlayer playerWithPlayerItem:playerItem];
@@ -819,47 +821,53 @@ int main(int argc, const char *argv[])
                                     frameState.shouldRender ? "yes" : "no");
                         if (playerItem.status == AVPlayerItemStatusFailed && playerItem.error) {
                             std::fprintf(stderr,
-                                         "DIAGNOSTIC: AVPlayerItem error: %s\n",
-                                         playerItem.error.localizedDescription.UTF8String);
+                                         "DIAGNOSTIC: AVPlayerItem failed: %s\n",
+                                         playerItem.error.localizedDescription.UTF8String ?: "unknown error");
                         }
                         lastStatusLog = now;
                     }
                 }
 
-                [player pause];
-            } catch (const std::exception &error) {
-                std::fprintf(stderr, "gav-monado-poc: %s\n", error.what());
-                if (currentPixelBuffer) {
-                    CVPixelBufferRelease(currentPixelBuffer);
-                    currentPixelBuffer = nullptr;
+                if (sessionRunning) {
+                    [player pause];
+                    playerStarted = false;
+                    checkXr(xrRequestExitSession(session), "xrRequestExitSession");
                 }
-                if (textureCache) {
-                    CFRelease(textureCache);
-                    textureCache = nullptr;
+            } catch (const std::exception &e) {
+                std::fprintf(stderr, "fatal: %s\n", e.what());
+                gStopRequested.store(true);
+            }
+
+            if (currentPixelBuffer) {
+                CVPixelBufferRelease(currentPixelBuffer);
+                currentPixelBuffer = nullptr;
+            }
+            if (textureCache) {
+                CFRelease(textureCache);
+                textureCache = nullptr;
+            }
+            for (EyeSwapchain &sc : eyeSwapchains) {
+                if (sc.handle != XR_NULL_HANDLE) {
+                    xrDestroySwapchain(sc.handle);
+                    sc.handle = XR_NULL_HANDLE;
                 }
-                for (auto &sc : eyeSwapchains) {
-                    if (sc.handle != XR_NULL_HANDLE) xrDestroySwapchain(sc.handle);
-                }
-                if (localSpace != XR_NULL_HANDLE) xrDestroySpace(localSpace);
-                if (session != XR_NULL_HANDLE) xrDestroySession(session);
-                if (instance != XR_NULL_HANDLE) xrDestroyInstance(instance);
-                return 1;
+            }
+            if (localSpace != XR_NULL_HANDLE) {
+                xrDestroySpace(localSpace);
+                localSpace = XR_NULL_HANDLE;
+            }
+            if (session != XR_NULL_HANDLE) {
+                xrDestroySession(session);
+                session = XR_NULL_HANDLE;
+            }
+            if (instance != XR_NULL_HANDLE) {
+                xrDestroyInstance(instance);
+                instance = XR_NULL_HANDLE;
             }
         } @catch (NSException *exception) {
-            std::fprintf(stderr,
-                         "gav-monado-poc: Objective-C exception: %s\n",
-                         exception.reason.UTF8String);
+            std::fprintf(stderr, "Objective-C exception: %s\n", exception.reason.UTF8String ?: "unknown exception");
             return 1;
         }
-
-        if (currentPixelBuffer) CVPixelBufferRelease(currentPixelBuffer);
-        if (textureCache) CFRelease(textureCache);
-        for (auto &sc : eyeSwapchains) {
-            if (sc.handle != XR_NULL_HANDLE) xrDestroySwapchain(sc.handle);
-        }
-        if (localSpace != XR_NULL_HANDLE) xrDestroySpace(localSpace);
-        if (session != XR_NULL_HANDLE) xrDestroySession(session);
-        if (instance != XR_NULL_HANDLE) xrDestroyInstance(instance);
-        return 0;
     }
+    return 0;
 }
